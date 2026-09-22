@@ -1,0 +1,37 @@
+#pragma once
+
+// Copy to config.h and fill in real values. Keep config.h out of version
+// control (see .gitignore).
+//
+// WiFi/MQTT credentials and device identity are NOT here -- they're
+// configured at runtime via the built-in web setup portal (see
+// runMaintenanceMode() in the .ino) and persisted in NVS. What's left
+// here is the OTA password, the setup portal's own AP password/timeout,
+// device identity/firmware version, and button-hold thresholds.
+
+// Deliberately different from the MQTT password -- OTA is a remote-flash
+// surface, worth keeping on its own credential rather than reusing the
+// broker password.
+static const char* OTA_PASSWORD  = "choose-an-ota-password";
+
+// Password for this device's own temporary setup WiFi network (e.g.
+// "P@cho ESP32-C3 Doorbell XXXX"). MUST be 8-63 characters -- that's a
+// hard WPA2 requirement, not just this library's preference. Only
+// broadcast while the portal is open, not during normal operation.
+static const char* AP_PASSWORD = "setup1234";
+// How long the setup portal stays open before giving up and resuming with
+// whatever settings it already had.
+static const uint32_t PORTAL_TIMEOUT_SEC = 600; // 10 min
+
+static const char* DEVICE_MANUFACTURER = "P@cho";
+static const char* DEVICE_MODEL        = "ESP32-C3 Doorbell";
+static const char* DEVICE_HW_VERSION   = "1.0";
+static const char* FIRMWARE_VERSION    = "1.0.0";
+
+// Button hold thresholds (BUTTON_PIN, active low). Released before
+// BUTTON_SETUP_HOLD_MS: normal doorbell press, unchanged. Held past it:
+// opens the setup portal immediately, without waiting for release. Held
+// past FACTORY_RESET_HOLD_MS again while the portal is open: wipes all
+// saved settings and restarts unconfigured.
+static const uint32_t BUTTON_SETUP_HOLD_MS  = 10000; // 10s
+static const uint32_t FACTORY_RESET_HOLD_MS = 5000;  // 5s
