@@ -54,6 +54,7 @@
 #include <Adafruit_NeoPixel.h>
 #include <ArduinoOTA.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 #include <Preferences.h>
 #include <vector>
 // OTA password, setup-portal AP password/timeout, device identity/firmware
@@ -163,13 +164,13 @@ void incrementTotalFailCount() {
 String baseTopic, doorbellEventTopic, availabilityTopic,
        wifiSignalTopic, resetReasonTopic,
        connectFailCountTopic, totalFailCountTopic, bootCountTopic,
-       firmwareVersionTopic, ledBrightnessStateTopic, ledBrightnessCommandTopic,
+       firmwareVersionTopic, uptimeTopic, ledBrightnessStateTopic, ledBrightnessCommandTopic,
        otaRestartCommandTopic;
 
 String discoveryDoorbellTopic, discoveryWifiSignalTopic,
        discoveryResetReasonTopic, discoveryConnectFailCountTopic,
        discoveryTotalFailCountTopic, discoveryBootCountTopic,
-       discoveryFirmwareVersionTopic, discoveryLedBrightnessTopic,
+       discoveryFirmwareVersionTopic, discoveryUptimeTopic, discoveryLedBrightnessTopic,
        discoveryOtaRestartTopic;
 
 void buildTopics() {
@@ -182,6 +183,7 @@ void buildTopics() {
   totalFailCountTopic   = baseTopic + "/total_fail_count/state";
   bootCountTopic        = baseTopic + "/boot_count/state";
   firmwareVersionTopic  = baseTopic + "/firmware_version/state";
+  uptimeTopic           = baseTopic + "/uptime/state";
   ledBrightnessStateTopic   = baseTopic + "/led_brightness/state";
   ledBrightnessCommandTopic = baseTopic + "/led_brightness/set";
   otaRestartCommandTopic    = baseTopic + "/ota_restart/set";
@@ -193,6 +195,7 @@ void buildTopics() {
   discoveryTotalFailCountTopic   = String("homeassistant/sensor/") + settings.deviceId + "/total_fail_count/config";
   discoveryBootCountTopic        = String("homeassistant/sensor/") + settings.deviceId + "/boot_count/config";
   discoveryFirmwareVersionTopic  = String("homeassistant/sensor/") + settings.deviceId + "/firmware_version/config";
+  discoveryUptimeTopic           = String("homeassistant/sensor/") + settings.deviceId + "/uptime/config";
   discoveryLedBrightnessTopic = String("homeassistant/number/") + settings.deviceId + "/led_brightness/config";
   discoveryOtaRestartTopic    = String("homeassistant/button/") + settings.deviceId + "/ota_restart/config";
 }
@@ -577,6 +580,23 @@ void publishDiscovery() {
     checkedPublish(discoveryFirmwareVersionTopic, 1, true, payload);
   }
 
+  // Uptime (diagnostic) -- seconds since this boot; zeroes on any reset or
+  // power loss (see uptimeSeconds())
+  {
+    String payload = String("{") +
+        "\"name\":\"Uptime\"," +
+        "\"unique_id\":\"" + settings.deviceId + "_uptime\"," +
+        "\"state_topic\":\"" + uptimeTopic + "\"," +
+        "\"unit_of_measurement\":\"s\"," +
+        "\"device_class\":\"duration\"," +
+        "\"state_class\":\"measurement\"," +
+        "\"entity_category\":\"diagnostic\"," +
+        "\"availability_topic\":\"" + availabilityTopic + "\"," +
+        "\"device\":" + deviceJson +
+        "}";
+    checkedPublish(discoveryUptimeTopic, 1, true, payload);
+  }
+
   // LED brightness (number entity, global brightness control)
   {
     String payload = String("{") +
@@ -743,6 +763,13 @@ String resetReasonString() {
   }
 }
 
+// Seconds since this boot. esp_timer_get_time() is 64-bit microseconds since
+// boot, so unlike millis() it doesn't wrap back to zero at ~49.7 days --
+// uptime should only ever zero on a real reset or power loss.
+uint32_t uptimeSeconds() {
+  return (uint32_t)(esp_timer_get_time() / 1000000LL);
+}
+
 void publishDiagnostics(bool force) {
   if (!mqttClient.connected()) return;
 
@@ -761,6 +788,7 @@ void publishDiagnostics(bool force) {
   checkedPublish(connectFailCountTopic, 1, true, String(connectFailCount));
   checkedPublish(totalFailCountTopic, 1, true, String(totalFailCount));
   checkedPublish(firmwareVersionTopic, 1, true, String(FIRMWARE_VERSION));
+  checkedPublish(uptimeTopic, 1, true, String(uptimeSeconds()));
 }
 
 // ---------------------------------------------------------------------------

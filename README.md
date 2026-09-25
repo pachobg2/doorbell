@@ -91,6 +91,7 @@ Mode, defaults to `doorbell_<chip-id>` if never configured).
 | Connect fail count (resets on success) | `.../connect_fail_count/state` | integer |
 | Total fail count (lifetime) | `.../total_fail_count/state` | integer |
 | Firmware version | `.../firmware_version/state` | string |
+| Uptime (zeroes on any reset/power loss) | `.../uptime/state` | seconds |
 | OTA request/restart | `.../ota_restart/set` | any payload |
 
 The doorbell press is modeled as Home Assistant's MQTT **`event` entity**
@@ -148,3 +149,4 @@ the setup portal (see "Setup Mode") and persisted in NVS.
 | Version | Date | Changes |
 |---|---|---|
 | v1.0.0 | 2026-09-22 | Initial release: WiFiManager setup portal, doorbell switch (GPIO0) doubling as the setup control (button-hold gestures, same convention as `smart_switch`), doorbell press modeled as an MQTT `event` entity, full diagnostic set (WiFi signal, reset reason, boot count, connect/total fail counts, firmware version), NVS-persisted LED brightness. |
+| v1.0.1 | 2026-09-25 | Added an `Uptime` diagnostic sensor (seconds since boot, `device_class: duration`). Uses `esp_timer_get_time()` (64-bit) rather than `millis()`, so it zeroes on any reboot or power loss but never wraps back to zero on its own at ~49.7 days. |
