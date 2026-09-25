@@ -29,9 +29,35 @@ static const char* DEVICE_HW_VERSION   = "1.0";
 static const char* FIRMWARE_VERSION    = "1.0.0";
 
 // Button hold thresholds (BUTTON_PIN, active low). Released before
-// BUTTON_SETUP_HOLD_MS: normal doorbell press, unchanged. Held past it:
+// BUTTON_SETUP_HOLD_MS: a normal doorbell press. Held past it:
 // opens the setup portal immediately, without waiting for release. Held
 // past FACTORY_RESET_HOLD_MS again while the portal is open: wipes all
 // saved settings and restarts unconfigured.
 static const uint32_t BUTTON_SETUP_HOLD_MS  = 10000; // 10s
 static const uint32_t FACTORY_RESET_HOLD_MS = 5000;  // 5s
+
+// ------------------------------------------------------------------
+// Deep sleep / timing
+// ------------------------------------------------------------------
+// The device sleeps until the doorbell switch is pressed or this heartbeat
+// timer fires (to report diagnostics/uptime and pick up remote commands).
+static const uint64_t HEARTBEAT_INTERVAL_US = 12ULL * 60 * 60 * 1000000ULL; // 12 hours
+// How long Home Assistant keeps a diagnostic sensor's last value before
+// marking it "unavailable" if the device stops reporting -- a multiple of
+// the heartbeat so a normal gap never trips it, but a dead battery does.
+static const uint32_t EXPIRE_AFTER_SEC = (uint32_t)(HEARTBEAT_INTERVAL_US / 1000000ULL) * 3;
+static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 8000;
+static const uint32_t MQTT_CONNECT_TIMEOUT_MS = 5000;  // per attempt
+static const uint32_t MQTT_CONNECT_ATTEMPTS   = 2;
+static const uint32_t MQTT_ACK_TIMEOUT_MS     = 2000;  // per publish attempt
+static const uint32_t MQTT_PUBLISH_ATTEMPTS   = 3;
+// Unconditional delay after the clean disconnect() call, giving the
+// library's background task real time to send the DISCONNECT packet before
+// WiFi is torn down (otherwise the broker sometimes fires the Last Will).
+static const uint32_t MQTT_DISCONNECT_DELAY_MS = 400;
+static const uint32_t OTA_WINDOW_MS = 5UL * 60 * 1000UL; // how long to stay awake for OTA once triggered
+// Force-restarts the device if it's ever awake longer than this -- a hang or
+// stuck library call -- so it can't drain the battery awake. Re-armed with a
+// longer deadline while an LED light-up, OTA window or setup portal
+// legitimately needs to stay awake (see the .ino).
+static const uint32_t AWAKE_WATCHDOG_TIMEOUT_MS = 90UL * 1000UL;

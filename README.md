@@ -1,39 +1,56 @@
-# doorbell — ESP32-C3-Zero MQTT doorbell
+# doorbell — ESP32-C3-Zero battery-powered MQTT doorbell
 
-Raw Arduino C++, `espMqttClient` with QoS 1 + PUBACK, non-blocking WiFi/MQTT
-reconnect with exponential backoff, LWT availability, retained HA MQTT
+Raw Arduino C++, `espMqttClient` with QoS 1 + PUBACK, retained HA MQTT
 discovery, diagnostic entities, NVS-persisted LED brightness/color/on-time,
-`ArduinoOTA`, manufacturer `P@cho`. Not battery-powered (for now) — stays
-connected continuously, no deep sleep, same architecture as `smart_switch`
-v2.0.0.
-
-WiFi, MQTT, and device identity are configured at runtime via a built-in
-`WiFiManager` web setup portal and persisted in NVS — same system as
-`door_sensor`/`TH_2_v4`/`smart_switch`. The doorbell switch doubles as the
-setup control (button-hold gestures), same convention `smart_switch`/
-`TH_2_v4` use.
+`ArduinoOTA`, manufacturer `P@cho`. **Battery-powered and deep-sleeping** (as
+of v2.0.0): it sleeps almost all the time and wakes when the doorbell switch
+is pressed, plus a 12-hour heartbeat wake to report diagnostics — same
+deep-sleep machinery as `door_sensor`, with the runtime `WiFiManager` setup
+portal used across the fleet.
 
 ## Files
 
 - `doorbell.ino` — the sketch.
 - `config.h.example` — copy to `config.h` and fill in: OTA password,
   setup-portal AP password/timeout, device identity/firmware version,
-  button-hold thresholds. WiFi/MQTT credentials are *not* here — see
-  "Setup Mode". Keep `config.h` out of git (already covered by
-  `.gitignore`).
+  button-hold thresholds, deep-sleep/MQTT timing. WiFi/MQTT credentials are
+  *not* here — see "Setup Mode". Keep `config.h` out of git (already covered
+  by `.gitignore`).
 
 ## Hardware
 
 ESP32-C3-Zero:
 
-- **GPIO0** — doorbell switch, one leg to GND, internal pull-up (active
-  low). Debounced press fires the doorbell event immediately; held ≥10s
-  opens the setup portal; held ≥5s again while the portal is open triggers
-  a factory reset (see "Setup Mode"). **Note**: on the *original* ESP32,
-  GPIO0 is a boot-mode strapping pin and wiring a switch there is risky.
-  On the ESP32-C3 the strapping pins are GPIO2/GPIO8/GPIO9 instead —
-  GPIO0 is a normal GPIO on this chip, so this wiring is fine here.
-- **GPIO10** — single WS2812 LED (same pin as `smart_switch`). Off by default; lights up in a chosen color for a chosen time after a doorbell press.
+- **GPIO0** — doorbell switch, one leg to GND (active low), wakes the device
+  from deep sleep. **Add an external ~10k pull-up from GPIO0 to 3.3V**:
+  deep-sleep GPIO wake needs a reliably-held HIGH while idle, and the
+  internal pull-up isn't dependable across sleep (same advice as
+  `TH_2_v4`/`door_sensor`). On the *original* ESP32, GPIO0 is a boot-mode
+  strapping pin and wiring a switch there is risky; on the ESP32-C3 the
+  strapping pins are GPIO2/GPIO8/GPIO9, so GPIO0 is a normal, wake-capable
+  GPIO here.
+- **GPIO10** — single WS2812 LED (same pin as `smart_switch`). Off except
+  after a press. Note the LED and the board's regulator draw a small
+  quiescent current even when "off" — that, not the ESP32 in deep sleep,
+  will likely dominate battery life.
+- No battery-voltage monitoring yet (no divider is wired on this board), so
+  there are no battery entities.
+
+## Behavior
+
+- **Press**: wakes the device and the LED lights up **immediately** (before
+  WiFi is even up) in the color chosen in HA for the time chosen in HA
+  (default 5 s). It then connects (with one full retry if that fails),
+  publishes the doorbell event **first** — ahead of discovery/diagnostics — to
+  keep ring latency low, then the diagnostics, and stays awake, still
+  connected, while the LED is lit: a further press in that window rings
+  again and restarts the timer. Then it goes back to sleep.
+- **Heartbeat** (every 12 h, `HEARTBEAT_INTERVAL_US`): wakes, publishes
+  diagnostics/uptime, applies any pending HA commands, sleeps. No LED.
+- **Awake watchdog**: a hardware timer force-restarts the device if it's
+  ever awake unexpectedly long, so a hang can't drain the battery.
+- If WiFi/MQTT can't connect on a press, the LED still lights (so the press
+  is acknowledged) but the ring is lost; the connect-fail counters go up.
 
 ## Before building
 
@@ -50,25 +67,31 @@ ESP32-C3-Zero:
 
 ## First flash vs. later updates
 
-First flash needs a USB cable. A never-configured device boots straight
-into the setup portal (see below). After that, `ArduinoOTA` exposes the
-board as a network port in `Tools > Port` — subsequent updates can go out
-over WiFi, protected by `OTA_PASSWORD` from `config.h`.
+First flash needs a USB cable. A never-configured device boots straight into
+the setup portal (see below). After that, updates go over WiFi via the
+**OTA Update** switch in Home Assistant: flip it on, then press the doorbell
+(or wait for the next heartbeat). The device sees the retained command on
+its next wake, clears it, and opens a ~5 minute OTA window (LED solid blue;
+pressing the doorbell cancels it) — it then shows up in `Tools > Port` as a
+network port, protected by `OTA_PASSWORD` from `config.h`. There is no
+button-hold OTA gesture.
 
 ## Setup Mode
 
 On first boot (or after a factory reset), the device broadcasts its own
-temporary WiFi network — `<manufacturer> <model> XXXX` (last 4 hex chars
-of the chip MAC), password from `AP_PASSWORD` in `config.h` — and serves a
-setup page: the normal WiFiManager network picker, plus MQTT broker
+temporary WiFi network — `<manufacturer> <model> XXXX` (last 4 hex chars of
+the chip MAC), password from `AP_PASSWORD` in `config.h` — and serves a setup
+page: the normal WiFiManager network picker, plus MQTT broker
 host/port/user/password and device name/ID fields on the same page, saved
 together in one submission. The portal times out after `PORTAL_TIMEOUT_SEC`
-(default 10 min) and resumes with whatever settings already existed.
+(default 10 min) and the device goes back to sleep with whatever settings it
+already had.
 
-To reopen the portal on an already-configured device, **hold the doorbell
-switch for 10 seconds** (`BUTTON_SETUP_HOLD_MS`) — it fires the instant the
-hold crosses that threshold, without needing to release first. The LED
-pulses blue for the duration of the hold and while the portal is open.
+To reopen the portal on an already-configured device, **press and hold the
+doorbell switch for 10 seconds** (`BUTTON_SETUP_HOLD_MS`) — it fires the
+instant the hold crosses that threshold, without needing to release first.
+The press still rings once at the start (harmless). The LED pulses blue while
+the portal is open.
 
 While the portal is open, **holding the switch again for 5 seconds**
 (`FACTORY_RESET_HOLD_MS`) wipes all saved settings — WiFi, MQTT, device
@@ -77,78 +100,76 @@ unconfigured. A quick press instead cancels the portal early.
 
 ## MQTT / Home Assistant
 
-Base topic: `doorbell/<device_id>/...` (device ID is set during Setup
-Mode, defaults to `doorbell_<chip-id>` if never configured).
+Base topic: `doorbell/<device_id>/...` (device ID is set during Setup Mode,
+defaults to `doorbell_<chip-id>` if never configured).
 
 | Purpose | Topic | Payload |
 |---|---|---|
 | Doorbell press (event) | `.../event` | `{"event_type":"press"}` (not retained) |
 | Availability / LWT | `.../availability` | `online` / `offline` |
-| LED brightness | `.../led_brightness/state`, `.../set` | 0-100 |
-| LED color (HA select) | `.../led_color/state`, `.../set` | `White` / `Red` / `Green` / `Blue` / `Yellow` / `Orange` / `Purple` / `Cyan` / `Pink` |
-| LED on-time (HA number) | `.../led_on_time/state`, `.../set` | seconds, 1-60 (default 5) |
+| LED brightness (retained cmd) | `.../led_brightness/state`, `.../set` | 0-100 |
+| LED color (HA select, retained cmd) | `.../led_color/state`, `.../set` | `White` / `Red` / `Green` / `Blue` / `Yellow` / `Orange` / `Purple` / `Cyan` / `Pink` |
+| LED on-time (HA number, retained cmd) | `.../led_on_time/state`, `.../set` | seconds, 1-60 (default 5) |
+| OTA Update (retained switch) | `.../ota/state`, `.../ota/set` | `ON` / `OFF` |
 | WiFi signal | `.../wifi_signal/state` | dBm |
 | Reset reason | `.../reset_reason/state` | string |
-| Boot count | `.../boot_count/state` | integer |
+| Boot count (wakes since last power loss) | `.../boot_count/state` | integer |
 | Connect fail count (resets on success) | `.../connect_fail_count/state` | integer |
 | Total fail count (lifetime) | `.../total_fail_count/state` | integer |
 | Firmware version | `.../firmware_version/state` | string |
-| Uptime (zeroes on any reset/power loss) | `.../uptime/state` | seconds |
-| OTA request/restart | `.../ota_restart/set` | any payload |
+| Uptime (zeroes on reset/power loss, keeps counting through deep sleep) | `.../uptime/state` | seconds |
 
-The doorbell press is modeled as Home Assistant's MQTT **`event` entity**
-(`device_class: "doorbell"`, `homeassistant/event/<device_id>/doorbell/config`)
-rather than a momentary binary_sensor — semantically correct for a
-stateless trigger, and the first project in this fleet to use that
-platform. Trigger automations off it the same way you would any other HA
-event entity (state changes to the event's timestamp/attributes on every
-firing, no ON/OFF to track).
+The doorbell press is Home Assistant's MQTT **`event` entity**
+(`device_class: "doorbell"`, `homeassistant/event/<device_id>/doorbell/config`),
+not a momentary binary_sensor — semantically correct for a stateless trigger.
+Trigger automations off it like any other HA event entity.
 
-On every MQTT connect the firmware publishes retained HA discovery configs
-for the doorbell event entity, the LED brightness / color / on-time entities, an
-OTA-restart button, and diagnostic sensors (WiFi signal, reset reason,
-boot count, connect/total fail counts, firmware version) — all bundled
-under one device in Home Assistant automatically, no `configuration.yaml`
-edits needed.
+Because the device sleeps, the controls (LED brightness/color/on-time, OTA
+Update) are **retained** MQTT commands that the device picks up on its next
+wake (a press or the heartbeat) and echoes back as state. A change to the
+LED color/on-time made in HA therefore takes effect on the next press; if
+that press is what wakes it, the LED recolors as soon as the retained
+command arrives (about a second in). Diagnostic sensors carry an
+`expire_after` of 3× the heartbeat (36 h), so a dead battery shows as
+"unavailable" rather than frozen values.
 
-LED brightness, color, and on-time persist in NVS (Preferences namespace
-`doorbell`), so they survive a reboot.
+Discovery configs are sent once per power-life, and again after any real
+(non-deep-sleep) reset so new entities appear after a flash without a power
+cycle.
 
 ## Status LED
 
 | LED | Meaning |
 |---|---|
-| Off | Normal idle state, including while WiFi/MQTT are down |
-| Lit in the selected **LED Color** for **LED On Time** seconds (default 5s) | A doorbell press — lights up even if MQTT is down; a press while lit restarts the timer |
-| 3 blue blinks | Boot animation, once MQTT first connects |
-| Pulsing blue | Setup-mode button hold in progress, or portal open |
+| Off | Normal idle state |
+| Lit in the selected **LED Color** for **LED On Time** seconds (default 5s) | A doorbell press — lights immediately on wake, even if WiFi/MQTT are down; a press while lit restarts the timer |
+| Solid blue | OTA window open |
+| Pulsing blue | Setup portal open |
 
 The color (a Home Assistant select: White, Red, Green, Blue, Yellow, Orange,
 Purple, Cyan, Pink; default White) and on-time (a number, 1-60 s, default 5)
 are chosen from HA, and the overall **LED Brightness** applies to all of the
-above.
+above. All three persist in NVS.
 
 ## Diagnostics
 
-WiFi signal, boot count, and connect/total fail counts republish every 2
-minutes. Reset reason is sent once per boot (or on every MQTT reconnect via
-`publishDiagnostics(true)` in `onMqttConnect`). Connect fail count resets
-to 0 on the next successful MQTT connect; total fail count is
-NVS-persisted and never resets — both increment together on every MQTT
-disconnect. Boot count is also NVS-persisted, incremented once per actual
-device boot. MQTT reconnects use exponential backoff (1s doubling to a 30s
-cap); WiFi has a single bounded 5s wait at boot only, then non-blocking
-retry via `pollWiFi()` every `loop()` iteration.
+Published on every wake (press or heartbeat). Connect fail count resets to 0
+on the next fully-acknowledged cycle; total fail count is lifetime (kept in
+RTC memory, so it clears if the battery is fully disconnected). Boot count
+increments once per wake, not per power-up. Uptime uses the RTC counter, so
+it continues across deep-sleep wakes and zeroes on power-on, manual reset,
+brownout, watchdog, software restart, or a dead-and-replaced battery.
 
 ## Config file
 
 `config.h` (gitignored) holds the OTA password, setup-portal AP
 password/timeout, device identity constants (`DEVICE_MANUFACTURER`,
-`DEVICE_MODEL`, `DEVICE_HW_VERSION`, `FIRMWARE_VERSION`), and button-hold
-thresholds — copy `config.h.example` to `config.h` and fill in real
-values. WiFi credentials, MQTT broker settings, and this device's own
-name/ID are **not** here — they're runtime settings, configured through
-the setup portal (see "Setup Mode") and persisted in NVS.
+`DEVICE_MODEL`, `DEVICE_HW_VERSION`, `FIRMWARE_VERSION`), button-hold
+thresholds, and the deep-sleep/MQTT timing constants — copy
+`config.h.example` to `config.h` and fill in real values. WiFi credentials,
+MQTT broker settings, and this device's own name/ID are **not** here —
+they're runtime settings, configured through the setup portal and persisted
+in NVS.
 
 ## Version History
 
@@ -156,4 +177,5 @@ the setup portal (see "Setup Mode") and persisted in NVS.
 |---|---|---|
 | v1.0.0 | 2026-09-22 | Initial release: WiFiManager setup portal, doorbell switch (GPIO0) doubling as the setup control (button-hold gestures, same convention as `smart_switch`), doorbell press modeled as an MQTT `event` entity, full diagnostic set (WiFi signal, reset reason, boot count, connect/total fail counts, firmware version), NVS-persisted LED brightness. |
 | v1.0.1 | 2026-09-25 | Added an `Uptime` diagnostic sensor (seconds since boot, `device_class: duration`). Uses `esp_timer_get_time()` (64-bit) rather than `millis()`, so it zeroes on any reboot or power loss but never wraps back to zero on its own at ~49.7 days. |
-| v1.1.0 | 2026-09-25 | LED is now off when idle (previously solid green while WiFi was connected) and lights up on a doorbell press instead of a brief white flash. New HA `select` entity **LED Color** (White/Red/Green/Blue/Yellow/Orange/Purple/Cyan/Pink, default White) and **LED On Time** number (1-60 s, default 5), both NVS-persisted and applied immediately; light-up is non-blocking and a press while lit restarts the timer. Boot animation and setup-mode pulse are unchanged. |
+| v1.1.0 | 2026-09-25 | LED is now off when idle (previously solid green while WiFi was connected) and lights up on a doorbell press instead of a brief white flash. New HA `select` entity **LED Color** and **LED On Time** number (1-60 s, default 5), both NVS-persisted and applied immediately; light-up is non-blocking and a press while lit restarts the timer. |
+| v2.0.0 | 2026-09-25 | **Battery-powered, deep-sleep rewrite.** Sleeps until the doorbell switch is pressed (GPIO0 level wake) or a 12 h heartbeat fires; LED lights instantly on wake, the ring is published first, and the device stays awake while the LED is lit. Built on `door_sensor`'s deep-sleep machinery (RTC-kept counters, awake watchdog, blocking connect with PUBACK-confirmed publishes, one full connect retry on a press). Uptime now uses the RTC counter so it continues across deep sleep and zeroes only on a real reset/power loss; boot count is now wakes since power loss; discovery re-sent after any real reset. Control entities (LED brightness/color/on-time) are retained commands picked up on the next wake. New retained **OTA Update** switch replaces the always-on `ArduinoOTA` and the OTA Restart button (removed). Setup portal is unchanged (10 s hold; 5 s in-portal factory reset). Adds deep-sleep/MQTT timing constants to `config.h`. Breaking: needs an external ~10k pull-up on GPIO0; no battery monitoring yet. |

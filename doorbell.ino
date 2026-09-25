@@ -1,51 +1,57 @@
 /*
- * doorbell — ESP32-C3-Zero MQTT doorbell
+ * doorbell — ESP32-C3-Zero battery-powered MQTT doorbell (deep sleep)
  * Raw Arduino/C++, espMqttClient, MQTT QoS 1, HA auto-discovery
  *
- * Mirrors smart_switch v2.0.0's architecture: espMqttClient, retained
- * discovery configs, LWT availability, diagnostic entities, runtime
- * WiFiManager setup portal (NVS-persisted settings, no compiled-in
- * credentials), ArduinoOTA. Not battery-powered for now, so there's no
- * deep sleep — it stays connected continuously.
+ * As of v2.0.0 this is a battery-powered, deep-sleeping device, built on the
+ * same machinery as door_sensor (deep sleep, RTC-kept counters, awake
+ * watchdog, blocking connect + PUBACK-confirmed publishes) with the runtime
+ * WiFiManager setup portal used across the fleet.
  *
- * The doorbell switch (GPIO0, one leg to GND) doubles as the setup
- * control, same button-reuse pattern smart_switch/TH_2_v4 use:
- *   - Debounced press: fires the doorbell event immediately (on press,
- *     not release — see handleButton() for why this differs from
- *     smart_switch's release-triggered relay toggle).
- *   - Held BUTTON_SETUP_HOLD_MS (10s): opens the setup portal immediately
- *     (doesn't wait for release).
- *   - Held FACTORY_RESET_HOLD_MS (5s) again while the portal is open:
- *     wipes all saved settings and restarts unconfigured. A quick press
- *     instead cancels the portal.
- *   - A never-configured device goes straight to the portal on boot.
- * No button-hold OTA gesture is needed (unlike TH_2_v4, which is
- * normally asleep) — ArduinoOTA already runs continuously in loop() on
- * this always-on device.
+ * How it works:
+ *   - It sleeps in deep sleep almost all the time. Pressing the doorbell
+ *     switch (GPIO0, one leg to GND) wakes it; a heartbeat timer wakes it
+ *     every HEARTBEAT_INTERVAL_US (12h) to report diagnostics.
+ *   - On a press wake the LED lights up immediately (before WiFi is even
+ *     up), then it connects, publishes the doorbell event FIRST (before
+ *     discovery/diagnostics, to keep ring latency as low as possible), then
+ *     the diagnostics, then stays awake while the LED is lit (still
+ *     connected, so further presses during that window are reported too),
+ *     then goes back to sleep.
+ *   - LED: off except after a press, when it lights in the color chosen in
+ *     HA (LED Color select) for the time chosen in HA (LED On Time number,
+ *     default 5s). Both persist in NVS. Because the device sleeps, a change
+ *     made in HA is picked up on the next wake (retained MQTT command) and
+ *     applies immediately if the LED is currently lit.
+ *   - Setup: a never-configured device goes straight to the WiFiManager
+ *     portal. On a configured device, hold the switch >= BUTTON_SETUP_HOLD_MS
+ *     (10s) to open it (the press still rings once first, harmlessly);
+ *     while it's open, holding again >= FACTORY_RESET_HOLD_MS (5s) wipes all
+ *     settings and restarts unconfigured, and a quick press cancels it.
+ *   - OTA: an "OTA Update" retained MQTT switch in HA. Flip it, then press the
+ *     doorbell (or wait for the next heartbeat): the device sees the retained
+ *     command on its next wake and opens a ~5 minute OTA window. There is no
+ *     button-hold OTA gesture (unlike TH_2_v4).
  *
- * The doorbell press itself is published as a Home Assistant MQTT
- * `event` entity (device_class "doorbell") rather than a momentary
- * binary_sensor — semantically correct for a stateless trigger, and a
- * new pattern for this fleet (see publishDiscovery()).
+ * The doorbell press is a Home Assistant MQTT `event` entity (device_class
+ * "doorbell"), QoS 1, not retained.
  *
- * LED: off when idle. A press lights it up in a color chosen from HA (LED
- * Color select) for a duration chosen from HA (LED On Time number, default
- * 5s), both NVS-persisted; a boot animation and the setup-mode pulse are the
- * only other times it lights. See lightLedForPress()/serviceLed().
- *
- * Diagnostics: WiFi signal, reset reason, boot count, connect-fail count
- * (resets on next successful connect), total-fail count (lifetime,
- * NVS-persisted), and firmware version — same set as smart_switch v2.0.0,
- * minus anything battery-specific.
+ * Diagnostics: WiFi signal, reset reason, boot count (wakes since the last
+ * power loss, like door_sensor), connect-fail count, total-fail count, firmware
+ * version, and uptime (RTC-counter based: continues across deep sleep, zeroes
+ * on any real reset or power loss). No battery-voltage monitoring yet -- no
+ * divider is wired on this board.
  *
  * Hardware:
- *   GPIO0  - doorbell switch, one leg to GND, INPUT_PULLUP (active low).
- *            NOTE: on the *original* ESP32, GPIO0 is a boot-mode
- *            strapping pin and wiring a switch there is risky. On the
- *            ESP32-C3 the strapping pins are GPIO2/GPIO8/GPIO9 instead --
- *            GPIO0 is a normal GPIO on this chip, so this wiring is fine
- *            here even though it wouldn't be on a classic ESP32 board.
- *   GPIO10 - single WS2812 status LED (same pin as smart_switch)
+ *   GPIO0  - doorbell switch, one leg to GND, INPUT_PULLUP while awake.
+ *            Deep-sleep GPIO wake needs a reliably-held HIGH while idle, and
+ *            the internal pull-up isn't dependable across deep sleep -- add an
+ *            EXTERNAL ~10k pull-up from GPIO0 to 3.3V (same advice as
+ *            TH_2_v4/door_sensor). NOTE: on the *original* ESP32, GPIO0 is a
+ *            boot-mode strapping pin; on the ESP32-C3 the strapping pins are
+ *            GPIO2/GPIO8/GPIO9, so GPIO0 is a normal (and wake-capable) GPIO.
+ *   GPIO10 - single WS2812 LED. Note it (and the board's regulator) draw a
+ *            small quiescent current even when "off" -- that, not the ESP32
+ *            in deep sleep, will likely dominate battery life.
  *
  * Libraries needed (Library Manager / PlatformIO):
  *   espMqttClient   (bertmelis/espMqttClient)
@@ -59,32 +65,28 @@
 #include <Adafruit_NeoPixel.h>
 #include <ArduinoOTA.h>
 #include <esp_system.h>
+#include <esp_sleep.h>
 #include <esp_timer.h>
+#include "esp_private/esp_clk.h" // esp_clk_rtc_time(), for uptime across deep sleep
 #include <Preferences.h>
 #include <vector>
 // OTA password, setup-portal AP password/timeout, device identity/firmware
-// version, and button-hold thresholds. WiFi/MQTT credentials are NOT here
-// -- they're runtime settings, see Settings below.
+// version, button-hold thresholds and timing. WiFi/MQTT credentials are NOT
+// here -- they're runtime settings, see Settings below.
 #include "config.h"
 
 // ---------------------------------------------------------------------------
 // Pins
 // ---------------------------------------------------------------------------
-static const uint8_t BUTTON_PIN = 0;  // doorbell switch, also doubles as the setup control
+static const uint8_t BUTTON_PIN = 0;  // doorbell switch, also the setup control and deep-sleep wake source
 static const uint8_t LED_PIN    = 10;
 static const uint8_t LED_COUNT  = 1;
 
-// Default LED brightness as a percentage (0-100), used until a value is
-// loaded from NVS or set via MQTT/HA.
 static const uint8_t DEFAULT_LED_BRIGHTNESS_PCT = 50;
 
 // ---------------------------------------------------------------------------
 // Runtime settings (WiFi/MQTT/identity, via the setup portal)
 // ---------------------------------------------------------------------------
-// Nothing here is compiled in -- read from NVS at boot (defaults to
-// unconfigured) and only ever written by runMaintenanceMode() after a
-// portal save, or wiped by a button-hold factory reset. Declared before
-// buildTopics() below since that reads settings.deviceId.
 struct Settings {
   String wifiSsid;
   String wifiPassword;
@@ -98,6 +100,7 @@ struct Settings {
 };
 Settings settings;
 Preferences settingsPrefs;
+Preferences prefs; // LED brightness/color/on-time
 
 String getShortChipId() {
   uint64_t mac = ESP.getEfuseMac();
@@ -135,32 +138,38 @@ void saveSettings() {
   settingsPrefs.end();
 }
 
-// Boot count / lifetime fail count: NVS-persisted, not RTC memory -- this
-// device doesn't deep-sleep, so a "boot" is a rare, meaningful event
-// (actual power cycle, crash, or OTA restart), and there's no flash-wear
-// concern from writing on every one of those.
-uint32_t bootCount = 0;
-uint32_t totalFailCount = 0; // lifetime MQTT disconnects, never resets
+// ---------------------------------------------------------------------------
+// Persisted state (survives deep sleep, in RTC memory)
+// ---------------------------------------------------------------------------
+RTC_DATA_ATTR bool discoverySent = false;
+RTC_DATA_ATTR uint32_t bootCount = 0;         // wakes since the last power loss
+RTC_DATA_ATTR uint32_t connectFailCount = 0;  // increments on any wake that fails to publish, resets on success
+RTC_DATA_ATTR uint32_t totalFailCount = 0;    // lifetime total failed wakes -- never resets
+RTC_DATA_ATTR uint8_t cachedWifiChannel = 0;  // 0 = unknown yet, let WiFi.begin() auto-select
 
-void loadCounters() {
-  settingsPrefs.begin("settings", true);
-  bootCount = settingsPrefs.getUInt("bootCount", 0);
-  totalFailCount = settingsPrefs.getUInt("totalFail", 0);
-  settingsPrefs.end();
+// ---------------------------------------------------------------------------
+// Uptime
+// ---------------------------------------------------------------------------
+// Time since the last real reset or power loss -- NOT since the last wake.
+// A deep-sleep timer/GPIO wake is a continuation of the same "up" period, so
+// it counts; any other reset reason (power-on, manual reset, brownout,
+// watchdog, software restart, a battery that died and was replaced...) zeroes
+// it. Uses the RTC counter, which keeps counting through deep sleep;
+// millis()/esp_timer don't. Called first thing in setup().
+RTC_DATA_ATTR uint64_t g_uptimeStartUs = 0;
+
+void initUptime() {
+  if (esp_reset_reason() != ESP_RST_DEEPSLEEP) {
+    g_uptimeStartUs = esp_clk_rtc_time();
+    // Any real reset (including the restart at the end of an OTA/USB flash,
+    // which leaves RTC memory intact) re-announces discovery once, so a
+    // newly added entity actually shows up in HA without a power cycle.
+    discoverySent = false;
+  }
 }
 
-void incrementBootCount() {
-  bootCount++;
-  settingsPrefs.begin("settings", false);
-  settingsPrefs.putUInt("bootCount", bootCount);
-  settingsPrefs.end();
-}
-
-void incrementTotalFailCount() {
-  totalFailCount++;
-  settingsPrefs.begin("settings", false);
-  settingsPrefs.putUInt("totalFail", totalFailCount);
-  settingsPrefs.end();
+uint32_t uptimeSeconds() {
+  return (uint32_t)((esp_clk_rtc_time() - g_uptimeStartUs) / 1000000ULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -169,16 +178,16 @@ void incrementTotalFailCount() {
 String baseTopic, doorbellEventTopic, availabilityTopic,
        wifiSignalTopic, resetReasonTopic,
        connectFailCountTopic, totalFailCountTopic, bootCountTopic,
-       firmwareVersionTopic, uptimeTopic, ledBrightnessStateTopic, ledBrightnessCommandTopic,
+       firmwareVersionTopic, uptimeTopic,
+       ledBrightnessStateTopic, ledBrightnessCommandTopic,
        ledColorStateTopic, ledColorCommandTopic, ledOnTimeStateTopic, ledOnTimeCommandTopic,
-       otaRestartCommandTopic;
+       otaCommandTopic, otaStateTopic;
 
 String discoveryDoorbellTopic, discoveryWifiSignalTopic,
        discoveryResetReasonTopic, discoveryConnectFailCountTopic,
        discoveryTotalFailCountTopic, discoveryBootCountTopic,
        discoveryFirmwareVersionTopic, discoveryUptimeTopic, discoveryLedBrightnessTopic,
-       discoveryLedColorTopic, discoveryLedOnTimeTopic,
-       discoveryOtaRestartTopic;
+       discoveryLedColorTopic, discoveryLedOnTimeTopic, discoveryOtaTopic;
 
 void buildTopics() {
   baseTopic = String("doorbell/") + settings.deviceId;
@@ -197,20 +206,22 @@ void buildTopics() {
   ledColorCommandTopic      = baseTopic + "/led_color/set";
   ledOnTimeStateTopic       = baseTopic + "/led_on_time/state";
   ledOnTimeCommandTopic     = baseTopic + "/led_on_time/set";
-  otaRestartCommandTopic    = baseTopic + "/ota_restart/set";
+  otaCommandTopic           = baseTopic + "/ota/set";
+  otaStateTopic             = baseTopic + "/ota/state";
 
+  String sbase = String("homeassistant/sensor/") + settings.deviceId;
   discoveryDoorbellTopic     = String("homeassistant/event/") + settings.deviceId + "/doorbell/config";
-  discoveryWifiSignalTopic   = String("homeassistant/sensor/") + settings.deviceId + "/wifi_signal/config";
-  discoveryResetReasonTopic  = String("homeassistant/sensor/") + settings.deviceId + "/reset_reason/config";
-  discoveryConnectFailCountTopic = String("homeassistant/sensor/") + settings.deviceId + "/connect_fail_count/config";
-  discoveryTotalFailCountTopic   = String("homeassistant/sensor/") + settings.deviceId + "/total_fail_count/config";
-  discoveryBootCountTopic        = String("homeassistant/sensor/") + settings.deviceId + "/boot_count/config";
-  discoveryFirmwareVersionTopic  = String("homeassistant/sensor/") + settings.deviceId + "/firmware_version/config";
-  discoveryUptimeTopic           = String("homeassistant/sensor/") + settings.deviceId + "/uptime/config";
+  discoveryWifiSignalTopic   = sbase + "/wifi_signal/config";
+  discoveryResetReasonTopic  = sbase + "/reset_reason/config";
+  discoveryConnectFailCountTopic = sbase + "/connect_fail_count/config";
+  discoveryTotalFailCountTopic   = sbase + "/total_fail_count/config";
+  discoveryBootCountTopic        = sbase + "/boot_count/config";
+  discoveryFirmwareVersionTopic  = sbase + "/firmware_version/config";
+  discoveryUptimeTopic           = sbase + "/uptime/config";
   discoveryLedBrightnessTopic = String("homeassistant/number/") + settings.deviceId + "/led_brightness/config";
   discoveryLedColorTopic      = String("homeassistant/select/") + settings.deviceId + "/led_color/config";
   discoveryLedOnTimeTopic     = String("homeassistant/number/") + settings.deviceId + "/led_on_time/config";
-  discoveryOtaRestartTopic    = String("homeassistant/button/") + settings.deviceId + "/ota_restart/config";
+  discoveryOtaTopic           = String("homeassistant/switch/") + settings.deviceId + "/ota/config";
 }
 
 // ---------------------------------------------------------------------------
@@ -218,14 +229,13 @@ void buildTopics() {
 // ---------------------------------------------------------------------------
 espMqttClient mqttClient;
 Adafruit_NeoPixel led(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
-Preferences prefs;
 
 uint8_t ledBrightnessPct = DEFAULT_LED_BRIGHTNESS_PCT; // 0-100, persisted in NVS
 
-// The LED is off except right after a doorbell press, when it lights up in
-// a color chosen from HA for a duration chosen from HA (both persisted in
-// NVS). The option names below are exactly what the HA select entity shows
-// and sends back, so they double as the MQTT payloads.
+// The LED is off except right after a doorbell press, when it lights up in a
+// color chosen from HA for a duration chosen from HA (both persisted in NVS).
+// The option names below are exactly what the HA select entity shows and
+// sends back, so they double as the MQTT payloads.
 struct LedColorOption { const char* name; uint8_t r, g, b; };
 static const LedColorOption LED_COLORS[] = {
   {"White",  255, 255, 255},
@@ -245,72 +255,164 @@ static const uint8_t MIN_LED_ON_SECS = 1;
 static const uint8_t MAX_LED_ON_SECS = 60;
 uint8_t ledColorIndex = DEFAULT_LED_COLOR_INDEX; // persisted in NVS
 uint8_t ledOnSecs = DEFAULT_LED_ON_SECS;         // persisted in NVS
-bool ledLit = false;             // true while a press-triggered light-up is active
-unsigned long ledLitUntilMs = 0; // millis() deadline for the light-up
+bool ledLit = false;              // true while a press-triggered light-up is active
+unsigned long ledLitStartMs = 0;  // when the current light-up began
+unsigned long ledLitUntilMs = 0;  // millis() deadline for the light-up
 
-// button debounce + hold tracking
+// button debounce + hold tracking (used while awake -- see handleButton())
 bool lastButtonReading = HIGH;
 bool buttonStable = HIGH;
 unsigned long lastButtonChangeMs = 0;
 static const unsigned long DEBOUNCE_MS = 20;
 unsigned long pressStartMs = 0;  // 0 == not currently tracking a press
 bool setupTriggered = false;     // true once the current press has already opened the portal
+bool g_portalExited = false;     // portal was opened mid-cycle and closed without saving
 
-// mqtt reconnect / diagnostics
-unsigned long lastMqttAttemptMs = 0;
-unsigned long mqttBackoffMs = 1000;
-static const unsigned long MQTT_BACKOFF_MAX_MS = 30000;
-uint32_t connectFailCount = 0; // resets to 0 on next successful connect
-bool everConnected = false;
-
-unsigned long lastWifiSignalPublishMs = 0;
-static const unsigned long WIFI_SIGNAL_INTERVAL_MS = 120000; // 2 min
-
-bool bootAnimationDone = false;
-
-// wifi reconnect state (non-blocking)
-bool wifiConnectInProgress = false;
-unsigned long wifiConnectStartMs = 0;
-static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
-
-// setup-portal LED pulse (used during a hold and while the portal's open)
+// setup-portal LED pulse (used while the portal's open)
 static const unsigned long SETUP_LED_BLINK_PERIOD_MS = 1000;
 static const unsigned long SETUP_LED_PULSE_MS = 150;
 
+// Set from the MQTT library's callbacks (its own background task), read
+// from the main flow.
+volatile bool mqttConnectedFlag = false;
+volatile uint16_t lastAckedPacketId = 0;
+
+// Remote commands arrive as retained messages right after subscribe.
+volatile bool g_otaCmdReceived = false;
+char g_otaCmdPayload[8] = {0};
+volatile bool g_brightnessCmdReceived = false;
+char g_brightnessCmdPayload[8] = {0};
+volatile bool g_colorCmdReceived = false;
+char g_colorCmdPayload[16] = {0};
+volatile bool g_onTimeCmdReceived = false;
+char g_onTimeCmdPayload[8] = {0};
+
 // ---------------------------------------------------------------------------
-// Forward declarations
+// Function declarations
 // ---------------------------------------------------------------------------
 void connectWiFi();
-void pollWiFi();
-bool checkedPublish(const String &topic, uint8_t qos, bool retain, const String &payload);
-void connectMqtt();
+bool attemptWifiConnect(uint8_t channel);
+bool connectMQTT();
+bool publishWithAck(const String& topic, const String& payload, bool retain);
+void sendDiscoveryConfig();
+int publishState(const String& resetReasonStr);
+void applyRemoteCommands();
+void publishLedSettings();
 void onMqttConnect(bool sessionPresent);
 void onMqttDisconnect(espMqttClientTypes::DisconnectReason reason);
-void onMqttMessage(const espMqttClientTypes::MessageProperties& properties,
-                    const char* topic, const uint8_t* payload, size_t len,
-                    size_t index, size_t total);
-void publishDiscovery();
+void onMqttPublish(uint16_t packetId);
+void onMqttMessage(const espMqttClientTypes::MessageProperties& properties, const char* topic,
+                   const uint8_t* payload, size_t len, size_t index, size_t total);
+void startAwakeWatchdog(uint32_t timeoutMs);
+void stopAwakeWatchdog();
 void fireDoorbellEvent();
 void handleButton();
+void setLedColor(uint8_t r, uint8_t g, uint8_t b);
 void updateStatusLed();
 void serviceLed();
 void lightLedForPress();
-void setLedColorIndex(uint8_t index, bool save, bool publish);
-void setLedOnSecs(uint8_t secs, bool save, bool publish);
-void publishLedSettings();
-void runBootAnimation();
-void publishDiagnostics(bool force);
-String resetReasonString();
-void setLedBrightness(uint8_t pct, bool save, bool publish);
-void publishLedBrightness();
-void setLedColor(uint8_t r, uint8_t g, uint8_t b);
+void setLedBrightness(uint8_t pct, bool save);
+void setLedColorIndex(uint8_t index, bool save);
+void setLedOnSecs(uint8_t secs, bool save);
+String resetReasonToString(esp_reset_reason_t reason);
+void enterOtaMode();
 void runMaintenanceMode(bool viaButton);
+void goToSleep();
 
 // ---------------------------------------------------------------------------
-// Setup
+// MQTT callbacks
+// ---------------------------------------------------------------------------
+void onMqttConnect(bool sessionPresent) {
+  mqttConnectedFlag = true;
+}
+
+void onMqttDisconnect(espMqttClientTypes::DisconnectReason reason) {
+  mqttConnectedFlag = false;
+  Serial.printf("MQTT disconnected, reason: %u\n", static_cast<uint8_t>(reason));
+}
+
+void onMqttPublish(uint16_t packetId) {
+  lastAckedPacketId = packetId;
+}
+
+static void captureCmd(char* dst, size_t dstSize, const uint8_t* payload, size_t len) {
+  size_t copyLen = len < dstSize - 1 ? len : dstSize - 1;
+  memcpy(dst, payload, copyLen);
+  dst[copyLen] = '\0';
+}
+
+void onMqttMessage(const espMqttClientTypes::MessageProperties& properties, const char* topic,
+                   const uint8_t* payload, size_t len, size_t index, size_t total) {
+  if (otaCommandTopic.equals(topic)) {
+    captureCmd(g_otaCmdPayload, sizeof(g_otaCmdPayload), payload, len);
+    g_otaCmdReceived = true;
+  } else if (ledBrightnessCommandTopic.equals(topic)) {
+    captureCmd(g_brightnessCmdPayload, sizeof(g_brightnessCmdPayload), payload, len);
+    g_brightnessCmdReceived = true;
+  } else if (ledColorCommandTopic.equals(topic)) {
+    captureCmd(g_colorCmdPayload, sizeof(g_colorCmdPayload), payload, len);
+    g_colorCmdReceived = true;
+  } else if (ledOnTimeCommandTopic.equals(topic)) {
+    captureCmd(g_onTimeCmdPayload, sizeof(g_onTimeCmdPayload), payload, len);
+    g_onTimeCmdReceived = true;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Awake watchdog
+// A hardware timer that force-restarts the device if it's ever awake too
+// long -- a hang, a stuck library call -- independent of everything else, so
+// it can't drain the battery awake. Re-armed with a longer deadline while a
+// light-up, OTA window or portal legitimately needs to stay awake.
+// ---------------------------------------------------------------------------
+esp_timer_handle_t g_watchdogTimer = nullptr;
+
+void watchdogTimeoutHandler(void* arg) {
+  esp_restart();
+}
+
+void startAwakeWatchdog(uint32_t timeoutMs) {
+  if (g_watchdogTimer != nullptr) {
+    esp_timer_stop(g_watchdogTimer);
+    esp_timer_delete(g_watchdogTimer);
+    g_watchdogTimer = nullptr;
+  }
+  esp_timer_create_args_t args = {};
+  args.callback = &watchdogTimeoutHandler;
+  args.arg = nullptr;
+  args.dispatch_method = ESP_TIMER_TASK;
+  args.name = "awake_wdt";
+  esp_timer_create(&args, &g_watchdogTimer);
+  esp_timer_start_once(g_watchdogTimer, (uint64_t)timeoutMs * 1000ULL);
+}
+
+void stopAwakeWatchdog() {
+  if (g_watchdogTimer != nullptr) {
+    esp_timer_stop(g_watchdogTimer);
+    esp_timer_delete(g_watchdogTimer);
+    g_watchdogTimer = nullptr;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Setup / main flow
 // ---------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
+  unsigned long bootMs = millis();
+  startAwakeWatchdog(AWAKE_WATCHDOG_TIMEOUT_MS); // re-armed with a longer deadline for a light-up/OTA/portal
+
+  initUptime();
+  bootCount++;
+
+  esp_sleep_wakeup_cause_t wakeupCause = esp_sleep_get_wakeup_cause();
+  bool pressWake = (wakeupCause == ESP_SLEEP_WAKEUP_GPIO); // even a tap that's already released by now
+  esp_reset_reason_t resetReason = esp_reset_reason();
+  String resetReasonStr = resetReasonToString(resetReason);
+  if (resetReason == ESP_RST_BROWNOUT) {
+    connectFailCount++; // a brownout mid-cycle means that wake never got to publish either
+    totalFailCount++;
+  }
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
@@ -327,359 +429,299 @@ void setup() {
   led.clear();
   led.show();
 
+  // Instant feedback: light the LED right away on a press wake, before WiFi
+  // or anything slow -- the visitor sees the press registered immediately.
+  if (pressWake) lightLedForPress();
+
   loadSettings();
-  loadCounters();
   buildTopics();
 
-  // A never-configured device goes straight to the portal -- no button
-  // hold needed, same as door_sensor/TH_2_v4/smart_switch.
+  Serial.printf("Boot #%lu, wakeup cause: %d (%s), reset: %s\n[settings] device_id=%s wifi_ssid=%s mqtt=%s:%u configured=%s\n",
+                (unsigned long)bootCount, (int)wakeupCause, pressWake ? "button press" : "timer/reset",
+                resetReasonStr.c_str(), settings.deviceId.c_str(), settings.wifiSsid.c_str(),
+                settings.mqttHost.c_str(), settings.mqttPort, settings.configured ? "yes" : "no");
+
+  // A never-configured device goes straight to the portal.
   if (!settings.configured) {
     runMaintenanceMode(false);
-    // Only reached if the portal timed out / failed -- nothing saved yet,
-    // so just keep retrying instead of falling through to a normal cycle
-    // with empty WiFi/MQTT settings.
-    Serial.println("[setup] Still unconfigured after portal timeout -- retrying.");
-    delay(2000);
-    ESP.restart();
+    // Only reached if the portal timed out -- a successful save restarts
+    // the device itself and never returns here.
+    goToSleep();
+    return;
   }
 
-  incrementBootCount();
+  // Seed the button state for the linger loop below: if the press that woke
+  // us is still down, its hold time counts from boot, and it must not fire
+  // a second event (that one is published below).
+  buttonStable = lastButtonReading = digitalRead(BUTTON_PIN);
+  if (pressWake && buttonStable == LOW) {
+    pressStartMs = bootMs > 0 ? bootMs : 1;
+  }
 
-  connectWiFi();
-
-  // One-time bounded wait at boot only — gives ArduinoOTA's mDNS responder
-  // and the first MQTT attempt a real chance at a live link. This never
-  // recurs after setup(), so it never blocks the button during normal
-  // operation the way a loop()-level blocking wait would.
-  {
-    unsigned long waitStart = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - waitStart < 5000) {
-      delay(100);
+  // Connect (one whole retry on a press wake -- a lost ring is worse than a
+  // slightly slower failure on a heartbeat wake).
+  bool connected = false;
+  for (int attempt = 1; attempt <= (pressWake ? 2 : 1) && !connected; attempt++) {
+    if (attempt > 1) {
+      Serial.println("Retrying connection for the press...");
+      mqttClient.disconnect(true);
+      WiFi.disconnect(true);
+      delay(200);
     }
+    connectWiFi();
+    connected = (WiFi.status() == WL_CONNECTED) && connectMQTT();
   }
-  if (WiFi.status() == WL_CONNECTED) {
-    wifiConnectInProgress = false;
-    Serial.printf("[wifi] connected, ip=%s\n", WiFi.localIP().toString().c_str());
+
+  if (connected) {
+    bool ringOk = true;
+    if (pressWake) {
+      // Event first, ahead of discovery/diagnostics, to keep ring latency down.
+      ringOk = publishWithAck(doorbellEventTopic, "{\"event_type\":\"press\"}", false);
+    }
+
+    if (!discoverySent) {
+      sendDiscoveryConfig();
+      discoverySent = true;
+    }
+
+    int failedTopics = publishState(resetReasonStr);
+    if (failedTopics == 0 && ringOk) {
+      connectFailCount = 0; // every topic confirmed by the broker, counter clears
+    } else {
+      Serial.printf("%d topic(s) never got a PUBACK this cycle (ring published: %s).\n",
+                    failedTopics, ringOk ? "yes" : "NO");
+      connectFailCount++;
+      totalFailCount++;
+    }
+
+    applyRemoteCommands();
+
+    if (g_otaCmdReceived && strcmp(g_otaCmdPayload, "ON") == 0) {
+      Serial.println("OTA requested via MQTT switch -- entering OTA window.");
+      // Clear the retained command immediately so we don't re-trigger on
+      // every subsequent wake, and reflect the reset back to the HA UI.
+      publishWithAck(otaCommandTopic, "OFF", true);
+      publishWithAck(otaStateTopic, "OFF", true);
+      enterOtaMode();
+    }
   } else {
-    Serial.println("[wifi] not yet connected at boot, will keep retrying in loop()");
+    Serial.println("WiFi/MQTT connect failed, skipping publish this cycle.");
+    connectFailCount++;
+    totalFailCount++;
   }
 
-  mqttClient.setServer(settings.mqttHost.c_str(), settings.mqttPort);
-  mqttClient.setCredentials(settings.mqttUser.c_str(), settings.mqttPassword.c_str());
-  mqttClient.setClientId(settings.deviceId.c_str());
-  mqttClient.setWill(availabilityTopic.c_str(), 1, true, "offline");
-  mqttClient.onConnect(onMqttConnect);
-  mqttClient.onDisconnect(onMqttDisconnect);
-  mqttClient.onMessage(onMqttMessage);
-  connectMqtt();
+  // Stay awake, still connected, while the LED is lit (a further press
+  // during that window is reported live and restarts the timer) or the
+  // button is still held (a hold this long opens the setup portal). A held
+  // button is only waited on for a bounded time, so a stuck switch can't keep
+  // the device awake.
+  unsigned long lingerStart = millis();
+  const unsigned long maxHeldLingerMs = BUTTON_SETUP_HOLD_MS + 3000UL;
+  while (!g_portalExited) {
+    serviceLed();
+    handleButton();
+    bool held = (buttonStable == LOW) && (millis() - lingerStart < maxHeldLingerMs);
+    if (!ledLit && !held) break;
+    delay(5);
+  }
 
-  ArduinoOTA.setHostname(settings.deviceId.c_str());
-  ArduinoOTA.setPassword(OTA_PASSWORD);
-  ArduinoOTA.begin();
+  if (g_portalExited) {
+    // Portal opened via a hold and closed without saving -- WiFi/MQTT are
+    // already torn down, just go back to sleep.
+    goToSleep();
+    return;
+  }
+
+  mqttClient.disconnect();
+  delay(MQTT_DISCONNECT_DELAY_MS);
+  WiFi.disconnect(true);
+  goToSleep();
 }
 
-// ---------------------------------------------------------------------------
-// Loop
-// ---------------------------------------------------------------------------
 void loop() {
-  pollWiFi();
-
-  if (!mqttClient.connected()) {
-    unsigned long now = millis();
-    if (now - lastMqttAttemptMs >= mqttBackoffMs) {
-      connectMqtt();
-    }
-  }
-
-  mqttClient.loop();
-  ArduinoOTA.handle();
-
-  handleButton();
-  serviceLed();
-
-  if (!bootAnimationDone && mqttClient.connected()) {
-    runBootAnimation();
-    bootAnimationDone = true;
-  }
-
-  unsigned long now = millis();
-  if (now - lastWifiSignalPublishMs >= WIFI_SIGNAL_INTERVAL_MS) {
-    lastWifiSignalPublishMs = now;
-    publishDiagnostics(false);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// MQTT publish helper — logs a failure instead of silently dropping it.
-// mqttClient.publish() returns 0 on failure (e.g. espMqttClient's internal
-// low-memory guard, or not connected).
-// ---------------------------------------------------------------------------
-bool checkedPublish(const String &topic, uint8_t qos, bool retain, const String &payload) {
-  uint16_t packetId = mqttClient.publish(topic.c_str(), qos, retain, payload.c_str());
-  if (packetId == 0) {
-    Serial.print("[mqtt] publish FAILED topic=");
-    Serial.print(topic);
-    Serial.print(" free_heap=");
-    Serial.println(ESP.getFreeHeap());
-  }
-  return packetId != 0;
+  // Never reached in normal operation -- the device deep-sleeps at the end of setup().
 }
 
 // ---------------------------------------------------------------------------
 // WiFi
 // ---------------------------------------------------------------------------
-void connectWiFi() {
-  if (WiFi.status() == WL_CONNECTED || wifiConnectInProgress) return;
+// Single connection attempt on the given channel (0 = let the radio
+// auto-scan/pick). Returns true if connected within WIFI_CONNECT_TIMEOUT_MS.
+bool attemptWifiConnect(uint8_t channel) {
+  WiFi.begin(settings.wifiSsid.c_str(), settings.wifiPassword.c_str(), channel);
 
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.begin(settings.wifiSsid.c_str(), settings.wifiPassword.c_str());
-  wifiConnectInProgress = true;
-  wifiConnectStartMs = millis();
-  Serial.println("[wifi] connecting...");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(20);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("WiFi connected in %lums, IP: %s, channel: %u\n",
+                  millis() - start, WiFi.localIP().toString().c_str(), WiFi.channel());
+    return true;
+  }
+  Serial.printf("[debug] Final WiFi status: %d\n", WiFi.status());
+  return false;
 }
 
-// Non-blocking — call every loop() iteration.
-void pollWiFi() {
-  if (WiFi.status() == WL_CONNECTED) {
-    if (wifiConnectInProgress) {
-      wifiConnectInProgress = false;
-      Serial.printf("[wifi] connected, ip=%s\n", WiFi.localIP().toString().c_str());
-    }
-    return;
-  }
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false); // no modem power-save during the connect -- faster/more reliable out of deep sleep
 
-  if (!wifiConnectInProgress) {
-    connectWiFi();
-  } else if (millis() - wifiConnectStartMs > WIFI_CONNECT_TIMEOUT_MS) {
-    Serial.println("[wifi] connect attempt timed out, will retry");
-    wifiConnectInProgress = false;
+  // Reusing the channel from the last successful connect skips most of the
+  // scan; fall back to a full scan if the cached channel attempt fails.
+  bool connected = attemptWifiConnect(cachedWifiChannel);
+  if (!connected && cachedWifiChannel != 0) {
+    Serial.println("[debug] Cached-channel connect failed, retrying with auto channel scan...");
+    WiFi.disconnect();
+    delay(100);
+    connected = attemptWifiConnect(0);
   }
+  cachedWifiChannel = connected ? WiFi.channel() : 0;
 }
 
 // ---------------------------------------------------------------------------
 // MQTT
 // ---------------------------------------------------------------------------
-void connectMqtt() {
-  lastMqttAttemptMs = millis();
-  if (WiFi.status() != WL_CONNECTED) return;
-  Serial.println("Connecting to MQTT...");
-  mqttClient.connect();
-}
+bool connectMQTT() {
+  mqttClient.setServer(settings.mqttHost.c_str(), settings.mqttPort);
+  mqttClient.setCredentials(settings.mqttUser.c_str(), settings.mqttPassword.c_str());
+  mqttClient.setClientId(settings.deviceId.c_str());
+  // LWT: broker marks the device "offline" if it drops without a clean disconnect
+  mqttClient.setWill(availabilityTopic.c_str(), 1, true, "offline");
+  mqttClient.onConnect(onMqttConnect);
+  mqttClient.onDisconnect(onMqttDisconnect);
+  mqttClient.onPublish(onMqttPublish);
+  mqttClient.onMessage(onMqttMessage);
 
-void onMqttConnect(bool sessionPresent) {
-  Serial.println("MQTT connected");
-  mqttBackoffMs = 1000;
-  everConnected = true;
-  connectFailCount = 0;
+  for (uint32_t attempt = 1; attempt <= MQTT_CONNECT_ATTEMPTS; attempt++) {
+    mqttConnectedFlag = false;
+    mqttClient.connect();
 
-  checkedPublish(availabilityTopic, 1, true, "online");
-
-  mqttClient.subscribe(ledBrightnessCommandTopic.c_str(), 1);
-  mqttClient.subscribe(ledColorCommandTopic.c_str(), 1);
-  mqttClient.subscribe(ledOnTimeCommandTopic.c_str(), 1);
-  mqttClient.subscribe(otaRestartCommandTopic.c_str(), 1);
-
-  publishDiscovery();
-  publishLedBrightness();
-  publishLedSettings();
-  updateStatusLed();
-  publishDiagnostics(true);
-}
-
-void onMqttDisconnect(espMqttClientTypes::DisconnectReason reason) {
-  Serial.printf("MQTT disconnected, reason: %u\n", static_cast<uint8_t>(reason));
-  if (everConnected) {
-    connectFailCount++;
-    incrementTotalFailCount();
-  }
-  mqttBackoffMs = min(mqttBackoffMs * 2, MQTT_BACKOFF_MAX_MS);
-}
-
-void onMqttMessage(const espMqttClientTypes::MessageProperties& properties,
-                    const char* topic, const uint8_t* payload, size_t len,
-                    size_t index, size_t total) {
-  String topicStr(topic);
-  String payloadStr;
-  payloadStr.reserve(len);
-  for (size_t i = 0; i < len; i++) payloadStr += (char)payload[i];
-
-  if (topicStr == ledColorCommandTopic) {
-    for (uint8_t i = 0; i < LED_COLOR_COUNT; i++) {
-      if (payloadStr.equalsIgnoreCase(LED_COLORS[i].name)) {
-        setLedColorIndex(i, true, true);
-        break;
-      }
+    unsigned long start = millis();
+    while (!mqttConnectedFlag && millis() - start < MQTT_CONNECT_TIMEOUT_MS) {
+      delay(10);
     }
-  } else if (topicStr == ledOnTimeCommandTopic) {
-    int secs = payloadStr.toInt();
-    if (secs < MIN_LED_ON_SECS) secs = MIN_LED_ON_SECS;
-    if (secs > MAX_LED_ON_SECS) secs = MAX_LED_ON_SECS;
-    setLedOnSecs((uint8_t)secs, true, true);
-  } else if (topicStr == ledBrightnessCommandTopic) {
-    int pct = payloadStr.toInt();
-    if (pct < 0) pct = 0;
-    if (pct > 100) pct = 100;
-    setLedBrightness((uint8_t)pct, true, true);
-  } else if (topicStr == otaRestartCommandTopic) {
-    Serial.println("OTA restart requested via MQTT, rebooting...");
-    checkedPublish(availabilityTopic, 1, true, "offline");
+
+    if (mqttConnectedFlag) {
+      Serial.printf("MQTT connected in %lums (attempt %lu)\n", millis() - start, (unsigned long)attempt);
+      publishWithAck(availabilityTopic, "online", true);
+
+      // Subscribe now: retained commands are delivered right away, and by
+      // the time the publishes below finish they've been received.
+      g_otaCmdReceived = g_brightnessCmdReceived = g_colorCmdReceived = g_onTimeCmdReceived = false;
+      mqttClient.subscribe(ledBrightnessCommandTopic.c_str(), 1);
+      mqttClient.subscribe(ledColorCommandTopic.c_str(), 1);
+      mqttClient.subscribe(ledOnTimeCommandTopic.c_str(), 1);
+      mqttClient.subscribe(otaCommandTopic.c_str(), 1);
+      return true;
+    }
+
+    Serial.printf("MQTT connect attempt %lu timed out.\n", (unsigned long)attempt);
+    mqttClient.disconnect(true); // force-clear state before retrying
     delay(200);
-    ESP.restart();
   }
+  return false;
+}
+
+// Publishes at QoS 1 and waits for the broker's PUBACK before returning,
+// retrying as a brand-new publish up to MQTT_PUBLISH_ATTEMPTS times.
+bool publishWithAck(const String& topic, const String& payload, bool retain) {
+  for (uint32_t attempt = 1; attempt <= MQTT_PUBLISH_ATTEMPTS; attempt++) {
+    lastAckedPacketId = 0;
+    uint16_t packetId = mqttClient.publish(topic.c_str(), 1, retain, payload.c_str());
+    if (packetId == 0) {
+      Serial.printf("[mqtt] queue failed for %s (attempt %lu/%lu)\n",
+                    topic.c_str(), (unsigned long)attempt, (unsigned long)MQTT_PUBLISH_ATTEMPTS);
+      delay(100);
+      continue;
+    }
+
+    unsigned long start = millis();
+    while (lastAckedPacketId != packetId && millis() - start < MQTT_ACK_TIMEOUT_MS) {
+      delay(5);
+    }
+    if (lastAckedPacketId == packetId) return true;
+
+    Serial.printf("[mqtt] no PUBACK for %s (attempt %lu/%lu)\n",
+                  topic.c_str(), (unsigned long)attempt, (unsigned long)MQTT_PUBLISH_ATTEMPTS);
+  }
+  Serial.printf("[mqtt] giving up on %s\n", topic.c_str());
+  return false;
 }
 
 // ---------------------------------------------------------------------------
-// Home Assistant discovery
+// Home Assistant discovery (sent once per power-life / real reset)
 // ---------------------------------------------------------------------------
-void publishDiscovery() {
-  String deviceJson = String("{") +
-      "\"identifiers\":[\"" + settings.deviceId + "\"]," +
-      "\"name\":\"" + settings.deviceName + "\"," +
-      "\"manufacturer\":\"" + DEVICE_MANUFACTURER + "\"," +
-      "\"model\":\"" + DEVICE_MODEL + "\"," +
-      "\"hw_version\":\"" + DEVICE_HW_VERSION + "\"," +
-      "\"sw_version\":\"" + FIRMWARE_VERSION + "\"" +
-      "}";
+static String deviceBlock() {
+  return String("\"device\":{\"identifiers\":[\"") + settings.deviceId
+      + "\"],\"name\":\"" + settings.deviceName
+      + "\",\"manufacturer\":\"" + DEVICE_MANUFACTURER
+      + "\",\"model\":\"" + DEVICE_MODEL
+      + "\",\"sw_version\":\"" + FIRMWARE_VERSION
+      + "\",\"hw_version\":\"" + DEVICE_HW_VERSION + "\"}";
+}
 
+// A diagnostic sensor entry. expire_after = 3x the heartbeat, so a dead
+// device eventually shows "unavailable" instead of frozen values.
+static void sendSensorDiscovery(const String& topic, const char* name, const char* uid,
+                                const String& stateTopic, const String& extra) {
+  String payload = String("{")
+    + "\"name\":\"" + name + "\","
+    + "\"unique_id\":\"" + settings.deviceId + "_" + uid + "\","
+    + "\"state_topic\":\"" + stateTopic + "\","
+    + extra
+    + "\"entity_category\":\"diagnostic\","
+    + "\"expire_after\":" + String(EXPIRE_AFTER_SEC) + ","
+    + "\"availability_topic\":\"" + availabilityTopic + "\","
+    + deviceBlock() + "}";
+  publishWithAck(topic, payload, true);
+}
+
+void sendDiscoveryConfig() {
   // Doorbell press (event entity -- stateless trigger, not a binary_sensor)
   {
-    String payload = String("{") +
-        "\"name\":\"Doorbell\"," +
-        "\"unique_id\":\"" + settings.deviceId + "_doorbell\"," +
-        "\"device_class\":\"doorbell\"," +
-        "\"event_types\":[\"press\"]," +
-        "\"state_topic\":\"" + doorbellEventTopic + "\"," +
-        "\"availability_topic\":\"" + availabilityTopic + "\"," +
-        "\"device\":" + deviceJson +
-        "}";
-    checkedPublish(discoveryDoorbellTopic, 1, true, payload);
+    String payload = String("{")
+      + "\"name\":\"Doorbell\","
+      + "\"unique_id\":\"" + settings.deviceId + "_doorbell\","
+      + "\"device_class\":\"doorbell\","
+      + "\"event_types\":[\"press\"],"
+      + "\"state_topic\":\"" + doorbellEventTopic + "\","
+      + "\"availability_topic\":\"" + availabilityTopic + "\","
+      + deviceBlock() + "}";
+    publishWithAck(discoveryDoorbellTopic, payload, true);
   }
 
-  // WiFi signal (diagnostic)
+  sendSensorDiscovery(discoveryWifiSignalTopic, "WiFi Signal", "wifi_signal", wifiSignalTopic,
+    "\"unit_of_measurement\":\"dBm\",\"device_class\":\"signal_strength\",\"state_class\":\"measurement\",");
+  sendSensorDiscovery(discoveryResetReasonTopic, "Reset Reason", "reset_reason", resetReasonTopic, "");
+  sendSensorDiscovery(discoveryBootCountTopic, "Boot Count", "boot_count", bootCountTopic,
+    "\"state_class\":\"total_increasing\",\"icon\":\"mdi:counter\",");
+  sendSensorDiscovery(discoveryConnectFailCountTopic, "Connect Fail Count", "connect_fail_count", connectFailCountTopic,
+    "\"state_class\":\"measurement\",\"icon\":\"mdi:wifi-alert\",");
+  sendSensorDiscovery(discoveryTotalFailCountTopic, "Total Fail Count", "total_fail_count", totalFailCountTopic,
+    "\"state_class\":\"total_increasing\",\"icon\":\"mdi:counter\",");
+  sendSensorDiscovery(discoveryFirmwareVersionTopic, "Firmware Version", "firmware_version", firmwareVersionTopic, "");
+  // Uptime -- seconds since the last real reset/power loss (deep-sleep wakes
+  // don't count as a reset, see initUptime())
+  sendSensorDiscovery(discoveryUptimeTopic, "Uptime", "uptime", uptimeTopic,
+    "\"unit_of_measurement\":\"s\",\"device_class\":\"duration\",\"state_class\":\"measurement\",");
+
+  // Controls: "retain":true makes HA publish commands retained, so a change
+  // made while this device sleeps is still on the broker when it next wakes.
+  // No expire_after -- these are controls, not readings.
   {
-    String payload = String("{") +
-        "\"name\":\"WiFi Signal\"," +
-        "\"unique_id\":\"" + settings.deviceId + "_wifi_signal\"," +
-        "\"state_topic\":\"" + wifiSignalTopic + "\"," +
-        "\"unit_of_measurement\":\"dBm\"," +
-        "\"device_class\":\"signal_strength\"," +
-        "\"state_class\":\"measurement\"," +
-        "\"entity_category\":\"diagnostic\"," +
-        "\"availability_topic\":\"" + availabilityTopic + "\"," +
-        "\"device\":" + deviceJson +
-        "}";
-    checkedPublish(discoveryWifiSignalTopic, 1, true, payload);
+    String payload = String("{")
+      + "\"name\":\"LED Brightness\","
+      + "\"unique_id\":\"" + settings.deviceId + "_led_brightness\","
+      + "\"state_topic\":\"" + ledBrightnessStateTopic + "\","
+      + "\"command_topic\":\"" + ledBrightnessCommandTopic + "\","
+      + "\"min\":0,\"max\":100,\"step\":1,\"unit_of_measurement\":\"%\","
+      + "\"icon\":\"mdi:brightness-percent\",\"retain\":true,"
+      + "\"availability_topic\":\"" + availabilityTopic + "\","
+      + deviceBlock() + "}";
+    publishWithAck(discoveryLedBrightnessTopic, payload, true);
   }
-
-  // Reset reason (diagnostic)
-  {
-    String payload = String("{") +
-        "\"name\":\"Reset Reason\"," +
-        "\"unique_id\":\"" + settings.deviceId + "_reset_reason\"," +
-        "\"state_topic\":\"" + resetReasonTopic + "\"," +
-        "\"entity_category\":\"diagnostic\"," +
-        "\"availability_topic\":\"" + availabilityTopic + "\"," +
-        "\"device\":" + deviceJson +
-        "}";
-    checkedPublish(discoveryResetReasonTopic, 1, true, payload);
-  }
-
-  // Boot count (diagnostic)
-  {
-    String payload = String("{") +
-        "\"name\":\"Boot Count\"," +
-        "\"unique_id\":\"" + settings.deviceId + "_boot_count\"," +
-        "\"state_topic\":\"" + bootCountTopic + "\"," +
-        "\"entity_category\":\"diagnostic\"," +
-        "\"state_class\":\"total_increasing\"," +
-        "\"icon\":\"mdi:counter\"," +
-        "\"availability_topic\":\"" + availabilityTopic + "\"," +
-        "\"device\":" + deviceJson +
-        "}";
-    checkedPublish(discoveryBootCountTopic, 1, true, payload);
-  }
-
-  // Connect fail count (diagnostic) -- resets to 0 on next successful
-  // connect, so "measurement" not "total_increasing".
-  {
-    String payload = String("{") +
-        "\"name\":\"Connect Fail Count\"," +
-        "\"unique_id\":\"" + settings.deviceId + "_connect_fail_count\"," +
-        "\"state_topic\":\"" + connectFailCountTopic + "\"," +
-        "\"entity_category\":\"diagnostic\"," +
-        "\"state_class\":\"measurement\"," +
-        "\"icon\":\"mdi:wifi-alert\"," +
-        "\"availability_topic\":\"" + availabilityTopic + "\"," +
-        "\"device\":" + deviceJson +
-        "}";
-    checkedPublish(discoveryConnectFailCountTopic, 1, true, payload);
-  }
-
-  // Total fail count (diagnostic) -- lifetime, never resets
-  {
-    String payload = String("{") +
-        "\"name\":\"Total Fail Count\"," +
-        "\"unique_id\":\"" + settings.deviceId + "_total_fail_count\"," +
-        "\"state_topic\":\"" + totalFailCountTopic + "\"," +
-        "\"entity_category\":\"diagnostic\"," +
-        "\"state_class\":\"total_increasing\"," +
-        "\"icon\":\"mdi:counter\"," +
-        "\"availability_topic\":\"" + availabilityTopic + "\"," +
-        "\"device\":" + deviceJson +
-        "}";
-    checkedPublish(discoveryTotalFailCountTopic, 1, true, payload);
-  }
-
-  // Firmware version (diagnostic)
-  {
-    String payload = String("{") +
-        "\"name\":\"Firmware Version\"," +
-        "\"unique_id\":\"" + settings.deviceId + "_firmware_version\"," +
-        "\"state_topic\":\"" + firmwareVersionTopic + "\"," +
-        "\"entity_category\":\"diagnostic\"," +
-        "\"availability_topic\":\"" + availabilityTopic + "\"," +
-        "\"device\":" + deviceJson +
-        "}";
-    checkedPublish(discoveryFirmwareVersionTopic, 1, true, payload);
-  }
-
-  // Uptime (diagnostic) -- seconds since this boot; zeroes on any reset or
-  // power loss (see uptimeSeconds())
-  {
-    String payload = String("{") +
-        "\"name\":\"Uptime\"," +
-        "\"unique_id\":\"" + settings.deviceId + "_uptime\"," +
-        "\"state_topic\":\"" + uptimeTopic + "\"," +
-        "\"unit_of_measurement\":\"s\"," +
-        "\"device_class\":\"duration\"," +
-        "\"state_class\":\"measurement\"," +
-        "\"entity_category\":\"diagnostic\"," +
-        "\"availability_topic\":\"" + availabilityTopic + "\"," +
-        "\"device\":" + deviceJson +
-        "}";
-    checkedPublish(discoveryUptimeTopic, 1, true, payload);
-  }
-
-  // LED brightness (number entity, global brightness control)
-  {
-    String payload = String("{") +
-        "\"name\":\"LED Brightness\"," +
-        "\"unique_id\":\"" + settings.deviceId + "_led_brightness\"," +
-        "\"state_topic\":\"" + ledBrightnessStateTopic + "\"," +
-        "\"command_topic\":\"" + ledBrightnessCommandTopic + "\"," +
-        "\"min\":0," +
-        "\"max\":100," +
-        "\"step\":1," +
-        "\"unit_of_measurement\":\"%\"," +
-        "\"icon\":\"mdi:brightness-percent\"," +
-        "\"availability_topic\":\"" + availabilityTopic + "\"," +
-        "\"device\":" + deviceJson +
-        "}";
-    checkedPublish(discoveryLedBrightnessTopic, 1, true, payload);
-  }
-
-  // LED color (select entity) -- what color the LED lights up on a press
   {
     String options = "[";
     for (uint8_t i = 0; i < LED_COLOR_COUNT; i++) {
@@ -687,78 +729,116 @@ void publishDiscovery() {
       options += String("\"") + LED_COLORS[i].name + "\"";
     }
     options += "]";
-    String payload = String("{") +
-        "\"name\":\"LED Color\"," +
-        "\"unique_id\":\"" + settings.deviceId + "_led_color\"," +
-        "\"state_topic\":\"" + ledColorStateTopic + "\"," +
-        "\"command_topic\":\"" + ledColorCommandTopic + "\"," +
-        "\"options\":" + options + "," +
-        "\"icon\":\"mdi:palette\"," +
-        "\"availability_topic\":\"" + availabilityTopic + "\"," +
-        "\"device\":" + deviceJson +
-        "}";
-    checkedPublish(discoveryLedColorTopic, 1, true, payload);
+    String payload = String("{")
+      + "\"name\":\"LED Color\","
+      + "\"unique_id\":\"" + settings.deviceId + "_led_color\","
+      + "\"state_topic\":\"" + ledColorStateTopic + "\","
+      + "\"command_topic\":\"" + ledColorCommandTopic + "\","
+      + "\"options\":" + options + ","
+      + "\"icon\":\"mdi:palette\",\"retain\":true,"
+      + "\"availability_topic\":\"" + availabilityTopic + "\","
+      + deviceBlock() + "}";
+    publishWithAck(discoveryLedColorTopic, payload, true);
   }
-
-  // LED on-time (number entity) -- how long the LED stays lit after a press
   {
-    String payload = String("{") +
-        "\"name\":\"LED On Time\"," +
-        "\"unique_id\":\"" + settings.deviceId + "_led_on_time\"," +
-        "\"state_topic\":\"" + ledOnTimeStateTopic + "\"," +
-        "\"command_topic\":\"" + ledOnTimeCommandTopic + "\"," +
-        "\"min\":" + String(MIN_LED_ON_SECS) + "," +
-        "\"max\":" + String(MAX_LED_ON_SECS) + "," +
-        "\"step\":1," +
-        "\"unit_of_measurement\":\"s\"," +
-        "\"icon\":\"mdi:timer-outline\"," +
-        "\"availability_topic\":\"" + availabilityTopic + "\"," +
-        "\"device\":" + deviceJson +
-        "}";
-    checkedPublish(discoveryLedOnTimeTopic, 1, true, payload);
+    String payload = String("{")
+      + "\"name\":\"LED On Time\","
+      + "\"unique_id\":\"" + settings.deviceId + "_led_on_time\","
+      + "\"state_topic\":\"" + ledOnTimeStateTopic + "\","
+      + "\"command_topic\":\"" + ledOnTimeCommandTopic + "\","
+      + "\"min\":" + String(MIN_LED_ON_SECS) + ",\"max\":" + String(MAX_LED_ON_SECS) + ",\"step\":1,"
+      + "\"unit_of_measurement\":\"s\",\"icon\":\"mdi:timer-outline\",\"retain\":true,"
+      + "\"availability_topic\":\"" + availabilityTopic + "\","
+      + deviceBlock() + "}";
+    publishWithAck(discoveryLedOnTimeTopic, payload, true);
   }
-
-  // OTA restart button (diagnostic) — reboots cleanly before an OTA push
+  // OTA Update: a retained switch (a plain "button" entity's press is a
+  // one-shot, non-retained message a sleeping device would simply miss).
   {
-    String payload = String("{") +
-        "\"name\":\"OTA Restart\"," +
-        "\"unique_id\":\"" + settings.deviceId + "_ota_restart\"," +
-        "\"command_topic\":\"" + otaRestartCommandTopic + "\"," +
-        "\"payload_press\":\"PRESS\"," +
-        "\"device_class\":\"restart\"," +
-        "\"entity_category\":\"diagnostic\"," +
-        "\"availability_topic\":\"" + availabilityTopic + "\"," +
-        "\"device\":" + deviceJson +
-        "}";
-    checkedPublish(discoveryOtaRestartTopic, 1, true, payload);
+    String payload = String("{")
+      + "\"name\":\"OTA Update\","
+      + "\"unique_id\":\"" + settings.deviceId + "_ota\","
+      + "\"command_topic\":\"" + otaCommandTopic + "\","
+      + "\"state_topic\":\"" + otaStateTopic + "\","
+      + "\"payload_on\":\"ON\",\"payload_off\":\"OFF\",\"retain\":true,"
+      + "\"entity_category\":\"config\","
+      + "\"availability_topic\":\"" + availabilityTopic + "\","
+      + deviceBlock() + "}";
+    publishWithAck(discoveryOtaTopic, payload, true);
+    publishWithAck(otaStateTopic, "OFF", true);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Per-wake state publish. Returns how many topics never got a PUBACK.
+// ---------------------------------------------------------------------------
+int publishState(const String& resetReasonStr) {
+  int failed = 0;
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!publishWithAck(wifiSignalTopic, String(WiFi.RSSI()), true)) failed++;
+  }
+  if (!publishWithAck(resetReasonTopic, resetReasonStr, true)) failed++;
+  if (!publishWithAck(bootCountTopic, String((unsigned long)bootCount), true)) failed++;
+  if (!publishWithAck(connectFailCountTopic, String((unsigned long)connectFailCount), true)) failed++;
+  if (!publishWithAck(totalFailCountTopic, String((unsigned long)totalFailCount), true)) failed++;
+  if (!publishWithAck(firmwareVersionTopic, String(FIRMWARE_VERSION), true)) failed++;
+  if (!publishWithAck(uptimeTopic, String((unsigned long)uptimeSeconds()), true)) failed++;
+  return failed;
+}
+
+// LED brightness/color/on-time: apply any command received this wake (if it
+// changed), then always echo the current values back as state.
+void applyRemoteCommands() {
+  if (g_brightnessCmdReceived) {
+    int pct = atoi(g_brightnessCmdPayload);
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    if ((uint8_t)pct != ledBrightnessPct) setLedBrightness((uint8_t)pct, true);
+  }
+  if (g_colorCmdReceived) {
+    for (uint8_t i = 0; i < LED_COLOR_COUNT; i++) {
+      if (strcasecmp(g_colorCmdPayload, LED_COLORS[i].name) == 0) {
+        if (i != ledColorIndex) setLedColorIndex(i, true);
+        break;
+      }
+    }
+  }
+  if (g_onTimeCmdReceived) {
+    int secs = atoi(g_onTimeCmdPayload);
+    if (secs < MIN_LED_ON_SECS) secs = MIN_LED_ON_SECS;
+    if (secs > MAX_LED_ON_SECS) secs = MAX_LED_ON_SECS;
+    if ((uint8_t)secs != ledOnSecs) setLedOnSecs((uint8_t)secs, true);
+  }
+  publishLedSettings();
+}
+
+void publishLedSettings() {
+  publishWithAck(ledBrightnessStateTopic, String(ledBrightnessPct), true);
+  publishWithAck(ledColorStateTopic, LED_COLORS[ledColorIndex].name, true);
+  publishWithAck(ledOnTimeStateTopic, String(ledOnSecs), true);
 }
 
 // ---------------------------------------------------------------------------
 // Doorbell event -- QoS 1, NOT retained (a stateless event shouldn't replay
 // a stale "someone rang" on every HA restart the way a retained topic would).
+// Used for presses that happen while already awake (the wake press itself is
+// published in setup()).
 // ---------------------------------------------------------------------------
 void fireDoorbellEvent() {
+  lightLedForPress(); // light first so the LED reacts instantly, even if MQTT is down
   if (mqttClient.connected()) {
-    checkedPublish(doorbellEventTopic, 1, false, "{\"event_type\":\"press\"}");
+    publishWithAck(doorbellEventTopic, "{\"event_type\":\"press\"}", false);
   }
-  // Light the LED regardless of MQTT state, so a press is acknowledged
-  // even if the broker is down.
-  lightLedForPress();
 }
 
 // ---------------------------------------------------------------------------
-// Button (GPIO0, active low, debounced) -- doubles as the setup control.
+// Button (GPIO0, active low, debounced) -- used while awake, during the
+// linger window. The press that woke the device is handled in setup().
 //
-// Fires on a debounced PRESS, not release -- unlike smart_switch's relay
-// toggle, a doorbell should ring the instant it's pressed. This means a
-// press that turns into a long setup-mode hold will still have rung once
-// first; harmless for a doorbell (no lasting side effect), unlike a relay
-// toggle would be.
-//
-// Held past BUTTON_SETUP_HOLD_MS: commits immediately (without waiting
-// for release) to opening the setup portal instead. See
-// runMaintenanceMode() for the in-portal factory-reset gesture.
+// A new debounced press rings again and restarts the LED timer. Held past
+// BUTTON_SETUP_HOLD_MS: commits immediately (without waiting for release) to
+// opening the setup portal. See runMaintenanceMode() for the in-portal
+// factory-reset gesture.
 // ---------------------------------------------------------------------------
 void handleButton() {
   bool reading = digitalRead(BUTTON_PIN);
@@ -789,20 +869,16 @@ void handleButton() {
     setupTriggered = true;
     Serial.println("[button] held past setup threshold -- entering Setup Mode.");
     runMaintenanceMode(true);
-    // runMaintenanceMode() only returns on portal timeout/cancel; resync
-    // debounce state in case the button is still held, so it doesn't
-    // immediately retrigger.
-    lastButtonReading = digitalRead(BUTTON_PIN);
-    buttonStable = lastButtonReading;
+    // Only returns on portal timeout/cancel (a save restarts the device).
+    g_portalExited = true;
     pressStartMs = 0;
-    setupTriggered = false;
   }
 
   lastButtonReading = reading;
 }
 
 // ---------------------------------------------------------------------------
-// LED status
+// LED
 // ---------------------------------------------------------------------------
 void setLedColor(uint8_t r, uint8_t g, uint8_t b) {
   led.setPixelColor(0, led.Color(r, g, b));
@@ -820,11 +896,15 @@ void updateStatusLed() {
 }
 
 // Non-blocking: lights the LED in the selected color and records the
-// deadline; serviceLed() (called every loop()) turns it off again. A press
-// while already lit restarts the timer.
+// deadline; serviceLed() turns it off again. A press while already lit
+// restarts the timer. Also re-arms the awake watchdog so it can't fire in
+// the middle of a (up to 60s) light-up.
 void lightLedForPress() {
   ledLit = true;
-  ledLitUntilMs = millis() + (unsigned long)ledOnSecs * 1000UL;
+  ledLitStartMs = millis();
+  ledLitUntilMs = ledLitStartMs + (unsigned long)ledOnSecs * 1000UL;
+  uint32_t wdMs = (uint32_t)ledOnSecs * 1000UL + 45000UL;
+  startAwakeWatchdog(wdMs > AWAKE_WATCHDOG_TIMEOUT_MS ? wdMs : AWAKE_WATCHDOG_TIMEOUT_MS);
   updateStatusLed();
 }
 
@@ -835,125 +915,104 @@ void serviceLed() {
   }
 }
 
-void setLedColorIndex(uint8_t index, bool save, bool publish) {
+void setLedBrightness(uint8_t pct, bool save) {
+  ledBrightnessPct = pct;
+  led.setBrightness(map(ledBrightnessPct, 0, 100, 0, 255));
+  led.show(); // redraw current color at the new brightness
+  if (save) prefs.putUChar("led_bright", ledBrightnessPct);
+}
+
+void setLedColorIndex(uint8_t index, bool save) {
   ledColorIndex = index;
   if (ledLit) updateStatusLed(); // recolor immediately if currently lit
   if (save) prefs.putUChar("led_color", ledColorIndex);
-  if (publish) publishLedSettings();
 }
 
-void setLedOnSecs(uint8_t secs, bool save, bool publish) {
+void setLedOnSecs(uint8_t secs, bool save) {
   ledOnSecs = secs;
+  if (ledLit) ledLitUntilMs = ledLitStartMs + (unsigned long)ledOnSecs * 1000UL; // applies to the light-up in progress
   if (save) prefs.putUChar("led_secs", ledOnSecs);
-  if (publish) publishLedSettings();
-}
-
-void publishLedSettings() {
-  if (!mqttClient.connected()) return;
-  checkedPublish(ledColorStateTopic, 1, true, LED_COLORS[ledColorIndex].name);
-  checkedPublish(ledOnTimeStateTopic, 1, true, String(ledOnSecs));
-}
-
-void setLedBrightness(uint8_t pct, bool save, bool publish) {
-  ledBrightnessPct = pct;
-  led.setBrightness(map(ledBrightnessPct, 0, 100, 0, 255));
-  led.show();
-
-  if (save) {
-    prefs.putUChar("led_bright", ledBrightnessPct);
-  }
-  if (publish) {
-    publishLedBrightness();
-  }
-}
-
-void publishLedBrightness() {
-  if (!mqttClient.connected()) return;
-  checkedPublish(ledBrightnessStateTopic, 1, true, String(ledBrightnessPct));
-}
-
-void runBootAnimation() {
-  for (int i = 0; i < 3; i++) {
-    setLedColor(0, 0, 255); // blue
-    delay(700);
-    setLedColor(0, 0, 0);
-    delay(700);
-  }
-  updateStatusLed();
 }
 
 // ---------------------------------------------------------------------------
 // Diagnostics
 // ---------------------------------------------------------------------------
-String resetReasonString() {
-  esp_reset_reason_t reason = esp_reset_reason();
+// Human-readable reset reason. Note that after a deep-sleep wake this is
+// always "deep_sleep_wake"; the interesting ones are brownout, watchdog,
+// panic and power_on.
+String resetReasonToString(esp_reset_reason_t reason) {
   switch (reason) {
-    case ESP_RST_POWERON:   return "Power on";
-    case ESP_RST_EXT:       return "External pin";
-    case ESP_RST_SW:        return "Software reset";
-    case ESP_RST_PANIC:     return "Panic/exception";
-    case ESP_RST_INT_WDT:   return "Interrupt watchdog";
-    case ESP_RST_TASK_WDT:  return "Task watchdog";
-    case ESP_RST_WDT:       return "Other watchdog";
-    case ESP_RST_BROWNOUT:  return "Brownout";
-    case ESP_RST_SDIO:      return "SDIO";
-    default:                return "Unknown";
+    case ESP_RST_POWERON:   return "power_on";
+    case ESP_RST_EXT:       return "external_pin";
+    case ESP_RST_SW:        return "software";
+    case ESP_RST_PANIC:     return "panic";
+    case ESP_RST_INT_WDT:   return "interrupt_watchdog";
+    case ESP_RST_TASK_WDT:  return "task_watchdog";
+    case ESP_RST_WDT:       return "other_watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep_sleep_wake";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    case ESP_RST_SDIO:      return "sdio";
+    default:                return "unknown";
   }
 }
 
-// Seconds since this boot. esp_timer_get_time() is 64-bit microseconds since
-// boot, so unlike millis() it doesn't wrap back to zero at ~49.7 days --
-// uptime should only ever zero on a real reset or power loss.
-uint32_t uptimeSeconds() {
-  return (uint32_t)(esp_timer_get_time() / 1000000LL);
-}
+// ---------------------------------------------------------------------------
+// OTA window (remote-triggered via the "OTA Update" switch). Assumes WiFi is
+// connected. LED solid blue = OTA window open; a doorbell press cancels it.
+// ---------------------------------------------------------------------------
+void enterOtaMode() {
+  startAwakeWatchdog(OTA_WINDOW_MS + 30000); // OTA legitimately needs to stay awake this long
+  ArduinoOTA.setHostname(settings.deviceId.c_str());
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.begin();
+  setLedColor(0, 0, 255);
+  Serial.printf("OTA ready, staying awake for up to %lu ms...\n", (unsigned long)OTA_WINDOW_MS);
 
-void publishDiagnostics(bool force) {
-  if (!mqttClient.connected()) return;
+  // Wait for the press that started this cycle to be released first, so it
+  // doesn't immediately cancel the window it just caused.
+  while (digitalRead(BUTTON_PIN) == LOW) delay(10);
+  delay(50);
 
-  if (WiFi.status() == WL_CONNECTED) {
-    long rssi = WiFi.RSSI();
-    checkedPublish(wifiSignalTopic, 1, true, String(rssi));
+  unsigned long start = millis();
+  while (millis() - start < OTA_WINDOW_MS) {
+    ArduinoOTA.handle();
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      Serial.println("Button pressed -- canceling OTA window early.");
+      break;
+    }
+    delay(10);
   }
-
-  static bool resetReasonSent = false;
-  if (force || !resetReasonSent) {
-    checkedPublish(resetReasonTopic, 1, true, resetReasonString());
-    resetReasonSent = true;
-  }
-
-  checkedPublish(bootCountTopic, 1, true, String(bootCount));
-  checkedPublish(connectFailCountTopic, 1, true, String(connectFailCount));
-  checkedPublish(totalFailCountTopic, 1, true, String(totalFailCount));
-  checkedPublish(firmwareVersionTopic, 1, true, String(FIRMWARE_VERSION));
-  checkedPublish(uptimeTopic, 1, true, String(uptimeSeconds()));
+  ledLit = false;
+  updateStatusLed();
+  startAwakeWatchdog(AWAKE_WATCHDOG_TIMEOUT_MS);
+  Serial.println("OTA window over, resuming normal cycle.");
 }
 
 // ---------------------------------------------------------------------------
 // Setup portal
 //
-// Entered when the button is held past BUTTON_SETUP_HOLD_MS, or when this
-// device has never been configured yet (settings.configured == false).
-// Broadcasts "<DEVICE_MANUFACTURER> <DEVICE_MODEL> XXXX" (last 4 hex chars
-// of the chip MAC), and serves a page (WiFiManager) with a WiFi picker plus
-// custom fields for MQTT and device identity -- one form, one Save. Holding
-// the button again for FACTORY_RESET_HOLD_MS while this page is open wipes
-// the device back to a fully unconfigured state instead. If the portal
-// succeeds, settings are saved and the device restarts. If it times out or
-// is cancelled, this returns and the caller resumes with whatever settings
-// already existed (unchanged).
+// Entered when the device has never been configured, or when the switch is
+// held past BUTTON_SETUP_HOLD_MS. Broadcasts "<DEVICE_MANUFACTURER>
+// <DEVICE_MODEL> XXXX" (last 4 hex chars of the chip MAC), and serves a page
+// (WiFiManager) with a WiFi picker plus custom fields for MQTT and device
+// identity -- one form, one Save. Holding the switch again for
+// FACTORY_RESET_HOLD_MS while the page is open wipes the device back to a
+// fully unconfigured state; a quick press cancels. If the portal succeeds,
+// settings are saved and the device restarts; if it times out or is
+// cancelled, this returns and the caller goes back to sleep with whatever
+// settings already existed.
 // ---------------------------------------------------------------------------
 void runMaintenanceMode(bool viaButton) {
   Serial.println(viaButton
     ? "Button held >=10s -- entering Setup Mode."
     : "No saved WiFi config yet -- entering first-time setup.");
+  startAwakeWatchdog((PORTAL_TIMEOUT_SEC + 60) * 1000UL);
 
-  // Clean disconnect before handing the radio to WiFiManager, in case this
-  // was reached mid-operation (viaButton) on an already-connected device.
+  // Clean teardown before handing the radio to WiFiManager, in case this
+  // was reached mid-cycle on an already-connected device.
   if (mqttClient.connected()) {
-    checkedPublish(availabilityTopic, 1, true, "offline");
     mqttClient.disconnect();
-    delay(200);
+    delay(MQTT_DISCONNECT_DELAY_MS);
   }
   WiFi.disconnect();
 
@@ -967,8 +1026,8 @@ void runMaintenanceMode(bool viaButton) {
     + "<strong>Device status</strong><br>"
     + "WiFi: " + wifiStatusStr + "<br>"
     + "MQTT broker: " + mqttStatusStr + "<br>"
-    + "Boot count: " + String(bootCount) + " &middot; connect fails: " + String(connectFailCount)
-    + " this run / " + String(totalFailCount) + " total"
+    + "Wake count: " + String((unsigned long)bootCount) + " &middot; connect fails: " + String((unsigned long)connectFailCount)
+    + " (" + String((unsigned long)totalFailCount) + " total)"
     + "</div>";
 
   char mqttPortStr[6];
@@ -1036,7 +1095,7 @@ void runMaintenanceMode(bool viaButton) {
         settingsPrefs.begin("settings", false);
         settingsPrefs.clear();
         settingsPrefs.end();
-        WiFi.disconnect(true, true);
+        WiFi.disconnect(true, true); // also erase the radio's own persisted WiFi credentials
         setLedColor(0, 0, 0);
         Serial.println("Restarting into unconfigured state...");
         Serial.flush();
@@ -1063,8 +1122,9 @@ void runMaintenanceMode(bool viaButton) {
 
   if (!connected) {
     Serial.println("Setup portal timed out / no connection -- resuming with existing settings.");
+    ledLit = false;
     setLedColor(0, 0, 0);
-    updateStatusLed();
+    stopAwakeWatchdog();
     return;
   }
 
@@ -1082,8 +1142,9 @@ void runMaintenanceMode(bool viaButton) {
   if (settings.mqttHost.length() == 0) {
     saveSettings();
     Serial.println("Setup portal closed with an empty MQTT broker host -- not marking as configured.");
+    ledLit = false;
     setLedColor(0, 0, 0);
-    updateStatusLed();
+    stopAwakeWatchdog();
     return;
   }
 
@@ -1093,8 +1154,46 @@ void runMaintenanceMode(bool viaButton) {
                 settings.deviceId.c_str(), settings.mqttHost.c_str(), settings.mqttPort);
 
   setLedColor(0, 0, 0);
+  stopAwakeWatchdog();
   Serial.println("Restarting into normal operation...");
   Serial.flush();
   delay(200);
   ESP.restart();
+}
+
+// ---------------------------------------------------------------------------
+// Sleep
+// ---------------------------------------------------------------------------
+void goToSleep() {
+  stopAwakeWatchdog(); // about to sleep on our own terms, no need for the failsafe to fire mid-sleep
+  ledLit = false;
+  setLedColor(0, 0, 0);
+
+  esp_sleep_enable_timer_wakeup(HEARTBEAT_INTERVAL_US);
+
+  // Wait for the switch to be released (and stop bouncing) before arming
+  // the level-triggered wake, or the tail of the press that got us here
+  // would wake the device again immediately. If it's stuck down, skip the
+  // GPIO wake for this sleep (timer only) rather than looping awake.
+  unsigned long waitStart = millis();
+  unsigned long highSince = 0;
+  while (millis() - waitStart < 30000UL) {
+    if (digitalRead(BUTTON_PIN) == HIGH) {
+      if (highSince == 0) highSince = millis();
+      if (millis() - highSince >= 50) break;
+    } else {
+      highSince = 0;
+    }
+    delay(5);
+  }
+  if (highSince != 0 && millis() - highSince >= 50) {
+    // Idle level is HIGH (pull-up), pressed pulls LOW -> wake on LOW.
+    esp_deep_sleep_enable_gpio_wakeup(1ULL << BUTTON_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
+  } else {
+    Serial.println("Switch appears stuck down -- sleeping on the timer only this time.");
+  }
+
+  Serial.println("Going to sleep...");
+  Serial.flush();
+  esp_deep_sleep_start();
 }
