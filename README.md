@@ -2,7 +2,7 @@
 
 Raw Arduino C++, `espMqttClient` with QoS 1 + PUBACK, non-blocking WiFi/MQTT
 reconnect with exponential backoff, LWT availability, retained HA MQTT
-discovery, diagnostic entities, NVS-persisted status-LED brightness,
+discovery, diagnostic entities, NVS-persisted LED brightness/color/on-time,
 `ArduinoOTA`, manufacturer `P@cho`. Not battery-powered (for now) — stays
 connected continuously, no deep sleep, same architecture as `smart_switch`
 v2.0.0.
@@ -33,7 +33,7 @@ ESP32-C3-Zero:
   GPIO0 is a boot-mode strapping pin and wiring a switch there is risky.
   On the ESP32-C3 the strapping pins are GPIO2/GPIO8/GPIO9 instead —
   GPIO0 is a normal GPIO on this chip, so this wiring is fine here.
-- **GPIO10** — single WS2812 status LED (same pin as `smart_switch`).
+- **GPIO10** — single WS2812 LED (same pin as `smart_switch`). Off by default; lights up in a chosen color for a chosen time after a doorbell press.
 
 ## Before building
 
@@ -85,6 +85,8 @@ Mode, defaults to `doorbell_<chip-id>` if never configured).
 | Doorbell press (event) | `.../event` | `{"event_type":"press"}` (not retained) |
 | Availability / LWT | `.../availability` | `online` / `offline` |
 | LED brightness | `.../led_brightness/state`, `.../set` | 0-100 |
+| LED color (HA select) | `.../led_color/state`, `.../set` | `White` / `Red` / `Green` / `Blue` / `Yellow` / `Orange` / `Purple` / `Cyan` / `Pink` |
+| LED on-time (HA number) | `.../led_on_time/state`, `.../set` | seconds, 1-60 (default 5) |
 | WiFi signal | `.../wifi_signal/state` | dBm |
 | Reset reason | `.../reset_reason/state` | string |
 | Boot count | `.../boot_count/state` | integer |
@@ -103,24 +105,28 @@ event entity (state changes to the event's timestamp/attributes on every
 firing, no ON/OFF to track).
 
 On every MQTT connect the firmware publishes retained HA discovery configs
-for the doorbell event entity, the LED-brightness number entity, an
+for the doorbell event entity, the LED brightness / color / on-time entities, an
 OTA-restart button, and diagnostic sensors (WiFi signal, reset reason,
 boot count, connect/total fail counts, firmware version) — all bundled
 under one device in Home Assistant automatically, no `configuration.yaml`
 edits needed.
 
-LED brightness persists in NVS (Preferences namespace `doorbell`), so it
-survives a reboot.
+LED brightness, color, and on-time persist in NVS (Preferences namespace
+`doorbell`), so they survive a reboot.
 
 ## Status LED
 
-| Color | Meaning |
+| LED | Meaning |
 |---|---|
+| Off | Normal idle state, including while WiFi/MQTT are down |
+| Lit in the selected **LED Color** for **LED On Time** seconds (default 5s) | A doorbell press — lights up even if MQTT is down; a press while lit restarts the timer |
 | 3 blue blinks | Boot animation, once MQTT first connects |
-| Green | Idle, WiFi connected |
-| Off | No WiFi |
-| Brief white flash | Doorbell press acknowledged |
 | Pulsing blue | Setup-mode button hold in progress, or portal open |
+
+The color (a Home Assistant select: White, Red, Green, Blue, Yellow, Orange,
+Purple, Cyan, Pink; default White) and on-time (a number, 1-60 s, default 5)
+are chosen from HA, and the overall **LED Brightness** applies to all of the
+above.
 
 ## Diagnostics
 
@@ -150,3 +156,4 @@ the setup portal (see "Setup Mode") and persisted in NVS.
 |---|---|---|
 | v1.0.0 | 2026-09-22 | Initial release: WiFiManager setup portal, doorbell switch (GPIO0) doubling as the setup control (button-hold gestures, same convention as `smart_switch`), doorbell press modeled as an MQTT `event` entity, full diagnostic set (WiFi signal, reset reason, boot count, connect/total fail counts, firmware version), NVS-persisted LED brightness. |
 | v1.0.1 | 2026-09-25 | Added an `Uptime` diagnostic sensor (seconds since boot, `device_class: duration`). Uses `esp_timer_get_time()` (64-bit) rather than `millis()`, so it zeroes on any reboot or power loss but never wraps back to zero on its own at ~49.7 days. |
+| v1.1.0 | 2026-09-25 | LED is now off when idle (previously solid green while WiFi was connected) and lights up on a doorbell press instead of a brief white flash. New HA `select` entity **LED Color** (White/Red/Green/Blue/Yellow/Orange/Purple/Cyan/Pink, default White) and **LED On Time** number (1-60 s, default 5), both NVS-persisted and applied immediately; light-up is non-blocking and a press while lit restarts the timer. Boot animation and setup-mode pulse are unchanged. |

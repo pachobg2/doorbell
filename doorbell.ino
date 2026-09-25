@@ -28,6 +28,11 @@
  * binary_sensor — semantically correct for a stateless trigger, and a
  * new pattern for this fleet (see publishDiscovery()).
  *
+ * LED: off when idle. A press lights it up in a color chosen from HA (LED
+ * Color select) for a duration chosen from HA (LED On Time number, default
+ * 5s), both NVS-persisted; a boot animation and the setup-mode pulse are the
+ * only other times it lights. See lightLedForPress()/serviceLed().
+ *
  * Diagnostics: WiFi signal, reset reason, boot count, connect-fail count
  * (resets on next successful connect), total-fail count (lifetime,
  * NVS-persisted), and firmware version — same set as smart_switch v2.0.0,
@@ -165,12 +170,14 @@ String baseTopic, doorbellEventTopic, availabilityTopic,
        wifiSignalTopic, resetReasonTopic,
        connectFailCountTopic, totalFailCountTopic, bootCountTopic,
        firmwareVersionTopic, uptimeTopic, ledBrightnessStateTopic, ledBrightnessCommandTopic,
+       ledColorStateTopic, ledColorCommandTopic, ledOnTimeStateTopic, ledOnTimeCommandTopic,
        otaRestartCommandTopic;
 
 String discoveryDoorbellTopic, discoveryWifiSignalTopic,
        discoveryResetReasonTopic, discoveryConnectFailCountTopic,
        discoveryTotalFailCountTopic, discoveryBootCountTopic,
        discoveryFirmwareVersionTopic, discoveryUptimeTopic, discoveryLedBrightnessTopic,
+       discoveryLedColorTopic, discoveryLedOnTimeTopic,
        discoveryOtaRestartTopic;
 
 void buildTopics() {
@@ -186,6 +193,10 @@ void buildTopics() {
   uptimeTopic           = baseTopic + "/uptime/state";
   ledBrightnessStateTopic   = baseTopic + "/led_brightness/state";
   ledBrightnessCommandTopic = baseTopic + "/led_brightness/set";
+  ledColorStateTopic        = baseTopic + "/led_color/state";
+  ledColorCommandTopic      = baseTopic + "/led_color/set";
+  ledOnTimeStateTopic       = baseTopic + "/led_on_time/state";
+  ledOnTimeCommandTopic     = baseTopic + "/led_on_time/set";
   otaRestartCommandTopic    = baseTopic + "/ota_restart/set";
 
   discoveryDoorbellTopic     = String("homeassistant/event/") + settings.deviceId + "/doorbell/config";
@@ -197,6 +208,8 @@ void buildTopics() {
   discoveryFirmwareVersionTopic  = String("homeassistant/sensor/") + settings.deviceId + "/firmware_version/config";
   discoveryUptimeTopic           = String("homeassistant/sensor/") + settings.deviceId + "/uptime/config";
   discoveryLedBrightnessTopic = String("homeassistant/number/") + settings.deviceId + "/led_brightness/config";
+  discoveryLedColorTopic      = String("homeassistant/select/") + settings.deviceId + "/led_color/config";
+  discoveryLedOnTimeTopic     = String("homeassistant/number/") + settings.deviceId + "/led_on_time/config";
   discoveryOtaRestartTopic    = String("homeassistant/button/") + settings.deviceId + "/ota_restart/config";
 }
 
@@ -208,6 +221,32 @@ Adafruit_NeoPixel led(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 Preferences prefs;
 
 uint8_t ledBrightnessPct = DEFAULT_LED_BRIGHTNESS_PCT; // 0-100, persisted in NVS
+
+// The LED is off except right after a doorbell press, when it lights up in
+// a color chosen from HA for a duration chosen from HA (both persisted in
+// NVS). The option names below are exactly what the HA select entity shows
+// and sends back, so they double as the MQTT payloads.
+struct LedColorOption { const char* name; uint8_t r, g, b; };
+static const LedColorOption LED_COLORS[] = {
+  {"White",  255, 255, 255},
+  {"Red",    255,   0,   0},
+  {"Green",    0, 255,   0},
+  {"Blue",     0,   0, 255},
+  {"Yellow", 255, 180,   0},
+  {"Orange", 255,  80,   0},
+  {"Purple", 160,   0, 255},
+  {"Cyan",     0, 255, 255},
+  {"Pink",   255,  60, 120},
+};
+static const uint8_t LED_COLOR_COUNT = sizeof(LED_COLORS) / sizeof(LED_COLORS[0]);
+static const uint8_t DEFAULT_LED_COLOR_INDEX = 0; // White
+static const uint8_t DEFAULT_LED_ON_SECS = 5;
+static const uint8_t MIN_LED_ON_SECS = 1;
+static const uint8_t MAX_LED_ON_SECS = 60;
+uint8_t ledColorIndex = DEFAULT_LED_COLOR_INDEX; // persisted in NVS
+uint8_t ledOnSecs = DEFAULT_LED_ON_SECS;         // persisted in NVS
+bool ledLit = false;             // true while a press-triggered light-up is active
+unsigned long ledLitUntilMs = 0; // millis() deadline for the light-up
 
 // button debounce + hold tracking
 bool lastButtonReading = HIGH;
@@ -254,6 +293,11 @@ void publishDiscovery();
 void fireDoorbellEvent();
 void handleButton();
 void updateStatusLed();
+void serviceLed();
+void lightLedForPress();
+void setLedColorIndex(uint8_t index, bool save, bool publish);
+void setLedOnSecs(uint8_t secs, bool save, bool publish);
+void publishLedSettings();
 void runBootAnimation();
 void publishDiagnostics(bool force);
 String resetReasonString();
@@ -273,6 +317,10 @@ void setup() {
   prefs.begin("doorbell", false);
   ledBrightnessPct = prefs.getUChar("led_bright", DEFAULT_LED_BRIGHTNESS_PCT);
   if (ledBrightnessPct > 100) ledBrightnessPct = DEFAULT_LED_BRIGHTNESS_PCT;
+  ledColorIndex = prefs.getUChar("led_color", DEFAULT_LED_COLOR_INDEX);
+  if (ledColorIndex >= LED_COLOR_COUNT) ledColorIndex = DEFAULT_LED_COLOR_INDEX;
+  ledOnSecs = prefs.getUChar("led_secs", DEFAULT_LED_ON_SECS);
+  if (ledOnSecs < MIN_LED_ON_SECS || ledOnSecs > MAX_LED_ON_SECS) ledOnSecs = DEFAULT_LED_ON_SECS;
 
   led.begin();
   led.setBrightness(map(ledBrightnessPct, 0, 100, 0, 255));
@@ -347,6 +395,7 @@ void loop() {
   ArduinoOTA.handle();
 
   handleButton();
+  serviceLed();
 
   if (!bootAnimationDone && mqttClient.connected()) {
     runBootAnimation();
@@ -427,10 +476,13 @@ void onMqttConnect(bool sessionPresent) {
   checkedPublish(availabilityTopic, 1, true, "online");
 
   mqttClient.subscribe(ledBrightnessCommandTopic.c_str(), 1);
+  mqttClient.subscribe(ledColorCommandTopic.c_str(), 1);
+  mqttClient.subscribe(ledOnTimeCommandTopic.c_str(), 1);
   mqttClient.subscribe(otaRestartCommandTopic.c_str(), 1);
 
   publishDiscovery();
   publishLedBrightness();
+  publishLedSettings();
   updateStatusLed();
   publishDiagnostics(true);
 }
@@ -452,7 +504,19 @@ void onMqttMessage(const espMqttClientTypes::MessageProperties& properties,
   payloadStr.reserve(len);
   for (size_t i = 0; i < len; i++) payloadStr += (char)payload[i];
 
-  if (topicStr == ledBrightnessCommandTopic) {
+  if (topicStr == ledColorCommandTopic) {
+    for (uint8_t i = 0; i < LED_COLOR_COUNT; i++) {
+      if (payloadStr.equalsIgnoreCase(LED_COLORS[i].name)) {
+        setLedColorIndex(i, true, true);
+        break;
+      }
+    }
+  } else if (topicStr == ledOnTimeCommandTopic) {
+    int secs = payloadStr.toInt();
+    if (secs < MIN_LED_ON_SECS) secs = MIN_LED_ON_SECS;
+    if (secs > MAX_LED_ON_SECS) secs = MAX_LED_ON_SECS;
+    setLedOnSecs((uint8_t)secs, true, true);
+  } else if (topicStr == ledBrightnessCommandTopic) {
     int pct = payloadStr.toInt();
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
@@ -615,6 +679,45 @@ void publishDiscovery() {
     checkedPublish(discoveryLedBrightnessTopic, 1, true, payload);
   }
 
+  // LED color (select entity) -- what color the LED lights up on a press
+  {
+    String options = "[";
+    for (uint8_t i = 0; i < LED_COLOR_COUNT; i++) {
+      if (i) options += ",";
+      options += String("\"") + LED_COLORS[i].name + "\"";
+    }
+    options += "]";
+    String payload = String("{") +
+        "\"name\":\"LED Color\"," +
+        "\"unique_id\":\"" + settings.deviceId + "_led_color\"," +
+        "\"state_topic\":\"" + ledColorStateTopic + "\"," +
+        "\"command_topic\":\"" + ledColorCommandTopic + "\"," +
+        "\"options\":" + options + "," +
+        "\"icon\":\"mdi:palette\"," +
+        "\"availability_topic\":\"" + availabilityTopic + "\"," +
+        "\"device\":" + deviceJson +
+        "}";
+    checkedPublish(discoveryLedColorTopic, 1, true, payload);
+  }
+
+  // LED on-time (number entity) -- how long the LED stays lit after a press
+  {
+    String payload = String("{") +
+        "\"name\":\"LED On Time\"," +
+        "\"unique_id\":\"" + settings.deviceId + "_led_on_time\"," +
+        "\"state_topic\":\"" + ledOnTimeStateTopic + "\"," +
+        "\"command_topic\":\"" + ledOnTimeCommandTopic + "\"," +
+        "\"min\":" + String(MIN_LED_ON_SECS) + "," +
+        "\"max\":" + String(MAX_LED_ON_SECS) + "," +
+        "\"step\":1," +
+        "\"unit_of_measurement\":\"s\"," +
+        "\"icon\":\"mdi:timer-outline\"," +
+        "\"availability_topic\":\"" + availabilityTopic + "\"," +
+        "\"device\":" + deviceJson +
+        "}";
+    checkedPublish(discoveryLedOnTimeTopic, 1, true, payload);
+  }
+
   // OTA restart button (diagnostic) — reboots cleanly before an OTA push
   {
     String payload = String("{") +
@@ -639,11 +742,9 @@ void fireDoorbellEvent() {
   if (mqttClient.connected()) {
     checkedPublish(doorbellEventTopic, 1, false, "{\"event_type\":\"press\"}");
   }
-  // Brief white flash acknowledges the press regardless of MQTT state --
-  // blocking delay is fine here, same tolerance as runBootAnimation().
-  setLedColor(255, 255, 255);
-  delay(150);
-  updateStatusLed();
+  // Light the LED regardless of MQTT state, so a press is acknowledged
+  // even if the broker is down.
+  lightLedForPress();
 }
 
 // ---------------------------------------------------------------------------
@@ -708,12 +809,49 @@ void setLedColor(uint8_t r, uint8_t g, uint8_t b) {
   led.show();
 }
 
+// The LED is off unless a press-triggered light-up is currently active.
 void updateStatusLed() {
-  if (WiFi.status() == WL_CONNECTED) {
-    setLedColor(0, 255, 0); // green, idle, WiFi connected
+  if (ledLit) {
+    const LedColorOption& c = LED_COLORS[ledColorIndex];
+    setLedColor(c.r, c.g, c.b);
   } else {
-    setLedColor(0, 0, 0); // off, no WiFi
+    setLedColor(0, 0, 0);
   }
+}
+
+// Non-blocking: lights the LED in the selected color and records the
+// deadline; serviceLed() (called every loop()) turns it off again. A press
+// while already lit restarts the timer.
+void lightLedForPress() {
+  ledLit = true;
+  ledLitUntilMs = millis() + (unsigned long)ledOnSecs * 1000UL;
+  updateStatusLed();
+}
+
+void serviceLed() {
+  if (ledLit && (long)(millis() - ledLitUntilMs) >= 0) {
+    ledLit = false;
+    updateStatusLed();
+  }
+}
+
+void setLedColorIndex(uint8_t index, bool save, bool publish) {
+  ledColorIndex = index;
+  if (ledLit) updateStatusLed(); // recolor immediately if currently lit
+  if (save) prefs.putUChar("led_color", ledColorIndex);
+  if (publish) publishLedSettings();
+}
+
+void setLedOnSecs(uint8_t secs, bool save, bool publish) {
+  ledOnSecs = secs;
+  if (save) prefs.putUChar("led_secs", ledOnSecs);
+  if (publish) publishLedSettings();
+}
+
+void publishLedSettings() {
+  if (!mqttClient.connected()) return;
+  checkedPublish(ledColorStateTopic, 1, true, LED_COLORS[ledColorIndex].name);
+  checkedPublish(ledOnTimeStateTopic, 1, true, String(ledOnSecs));
 }
 
 void setLedBrightness(uint8_t pct, bool save, bool publish) {
