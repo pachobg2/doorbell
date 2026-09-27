@@ -37,9 +37,12 @@
  *
  * Diagnostics: WiFi signal, reset reason, boot count (wakes since the last
  * power loss, like door_sensor), connect-fail count, total-fail count, firmware
- * version, and uptime (RTC-counter based: continues across deep sleep, zeroes
- * on any real reset or power loss). No battery-voltage monitoring yet -- no
- * divider is wired on this board.
+ * version, uptime (RTC-counter based: continues across deep sleep, zeroes on
+ * any real reset or power loss), a Device Status sensor ("awake" while
+ * connected and doing something, "asleep" the rest of the time -- published
+ * right before the final MQTT disconnect each cycle), and battery voltage
+ * (raw + calibrated)/percent/low flag/calibration offset, same mechanism as
+ * door_sensor (piecewise BATT_CAL curve + an HA-adjustable volts offset).
  *
  * Hardware:
  *   GPIO0  - doorbell switch, one leg to GND, INPUT_PULLUP while awake.
@@ -49,6 +52,7 @@
  *            TH_2_v4/door_sensor). NOTE: on the *original* ESP32, GPIO0 is a
  *            boot-mode strapping pin; on the ESP32-C3 the strapping pins are
  *            GPIO2/GPIO8/GPIO9, so GPIO0 is a normal (and wake-capable) GPIO.
+ *   GPIO1  - battery voltage divider (220k/220k -> BATT_DIVIDER_RATIO 2.0), ADC-capable.
  *   GPIO10 - single WS2812 LED. Note it (and the board's regulator) draw a
  *            small quiescent current even when "off" -- that, not the ESP32
  *            in deep sleep, will likely dominate battery life.
@@ -81,6 +85,7 @@
 static const uint8_t BUTTON_PIN = 0;  // doorbell switch, also the setup control and deep-sleep wake source
 static const uint8_t LED_PIN    = 10;
 static const uint8_t LED_COUNT  = 1;
+static const gpio_num_t BATT_PIN = GPIO_NUM_1; // battery voltage divider (220k/220k), ADC-capable
 
 static const uint8_t DEFAULT_LED_BRIGHTNESS_PCT = 50;
 
@@ -97,6 +102,12 @@ struct Settings {
   String deviceId;   // used in MQTT topics/unique_ids -- keep stable once this device exists in HA
   String deviceName; // friendly name shown in Home Assistant
   bool configured = false;
+  // Added to the raw (BATT_DIVIDER_RATIO reading, before BATT_CAL) plus the
+  // BATT_CAL curve correction, to get the final reported battery voltage --
+  // e.g. 0.15 means "add 0.15V to whatever the hardware+curve reports".
+  // Adjustable at runtime from HA via the "Battery Calibration Offset"
+  // number entity; 0 = no correction.
+  float battVoltageOffsetV = 0.0f;
 };
 Settings settings;
 Preferences settingsPrefs;
@@ -121,6 +132,7 @@ void loadSettings() {
   settings.mqttPassword = settingsPrefs.getString("mqttPass", "");
   settings.deviceId     = settingsPrefs.getString("deviceId", "doorbell_" + chipId);
   settings.deviceName   = settingsPrefs.getString("deviceName", "Doorbell " + chipId);
+  settings.battVoltageOffsetV = settingsPrefs.getFloat("battOffsetV", 0.0f);
   settingsPrefs.end();
 }
 
@@ -135,6 +147,7 @@ void saveSettings() {
   settingsPrefs.putString("mqttPass", settings.mqttPassword);
   settingsPrefs.putString("deviceId", settings.deviceId);
   settingsPrefs.putString("deviceName", settings.deviceName);
+  settingsPrefs.putFloat("battOffsetV", settings.battVoltageOffsetV);
   settingsPrefs.end();
 }
 
@@ -181,13 +194,17 @@ String baseTopic, doorbellEventTopic, availabilityTopic,
        firmwareVersionTopic, uptimeTopic,
        ledBrightnessStateTopic, ledBrightnessCommandTopic,
        ledColorStateTopic, ledColorCommandTopic, ledOnTimeStateTopic, ledOnTimeCommandTopic,
-       otaCommandTopic, otaStateTopic;
+       otaCommandTopic, otaStateTopic,
+       batteryVoltageTopic, batteryVRawTopic, batteryPercentTopic, batteryLowTopic,
+       batteryCalOffsetTopic, batteryCalOffsetSetTopic, deviceStatusTopic;
 
 String discoveryDoorbellTopic, discoveryWifiSignalTopic,
        discoveryResetReasonTopic, discoveryConnectFailCountTopic,
        discoveryTotalFailCountTopic, discoveryBootCountTopic,
        discoveryFirmwareVersionTopic, discoveryUptimeTopic, discoveryLedBrightnessTopic,
-       discoveryLedColorTopic, discoveryLedOnTimeTopic, discoveryOtaTopic;
+       discoveryLedColorTopic, discoveryLedOnTimeTopic, discoveryOtaTopic,
+       discoveryBatteryVoltageTopic, discoveryBatteryVRawTopic, discoveryBatteryPercentTopic,
+       discoveryBatteryLowTopic, discoveryBatteryCalOffsetTopic, discoveryDeviceStatusTopic;
 
 void buildTopics() {
   baseTopic = String("doorbell/") + settings.deviceId;
@@ -208,6 +225,13 @@ void buildTopics() {
   ledOnTimeCommandTopic     = baseTopic + "/led_on_time/set";
   otaCommandTopic           = baseTopic + "/ota/set";
   otaStateTopic             = baseTopic + "/ota/state";
+  batteryVoltageTopic     = baseTopic + "/battery_voltage/state";
+  batteryVRawTopic        = baseTopic + "/battery_voltage_raw/state"; // pre-calibration, for comparing against a multimeter
+  batteryPercentTopic     = baseTopic + "/battery_percent/state";
+  batteryLowTopic         = baseTopic + "/battery_low/state";
+  batteryCalOffsetTopic   = baseTopic + "/battery_cal_offset/state";
+  batteryCalOffsetSetTopic = baseTopic + "/battery_cal_offset/set";
+  deviceStatusTopic       = baseTopic + "/device_status/state";
 
   String sbase = String("homeassistant/sensor/") + settings.deviceId;
   discoveryDoorbellTopic     = String("homeassistant/event/") + settings.deviceId + "/doorbell/config";
@@ -222,6 +246,12 @@ void buildTopics() {
   discoveryLedColorTopic      = String("homeassistant/select/") + settings.deviceId + "/led_color/config";
   discoveryLedOnTimeTopic     = String("homeassistant/number/") + settings.deviceId + "/led_on_time/config";
   discoveryOtaTopic           = String("homeassistant/switch/") + settings.deviceId + "/ota/config";
+  discoveryBatteryVoltageTopic = sbase + "/battery_voltage/config";
+  discoveryBatteryVRawTopic    = sbase + "/battery_voltage_raw/config";
+  discoveryBatteryPercentTopic = sbase + "/battery_percent/config";
+  discoveryBatteryLowTopic     = String("homeassistant/binary_sensor/") + settings.deviceId + "/battery_low/config";
+  discoveryBatteryCalOffsetTopic = String("homeassistant/number/") + settings.deviceId + "/battery_cal_offset/config";
+  discoveryDeviceStatusTopic     = sbase + "/device_status/config";
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +316,8 @@ volatile bool g_colorCmdReceived = false;
 char g_colorCmdPayload[16] = {0};
 volatile bool g_onTimeCmdReceived = false;
 char g_onTimeCmdPayload[8] = {0};
+volatile bool g_battCalCmdReceived = false;
+char g_battCalCmdPayload[12] = {0};
 
 // ---------------------------------------------------------------------------
 // Function declarations
@@ -295,8 +327,10 @@ bool attemptWifiConnect(uint8_t channel);
 bool connectMQTT();
 bool publishWithAck(const String& topic, const String& payload, bool retain);
 void sendDiscoveryConfig();
-int publishState(const String& resetReasonStr);
+int publishState(const String& resetReasonStr, float batteryVoltage, float rawVoltage, float batteryPercent);
 void applyRemoteCommands();
+float calibrateBatteryVoltage(float raw);
+float batteryPercentage(float v);
 void publishLedSettings();
 void onMqttConnect(bool sessionPresent);
 void onMqttDisconnect(espMqttClientTypes::DisconnectReason reason);
@@ -355,6 +389,9 @@ void onMqttMessage(const espMqttClientTypes::MessageProperties& properties, cons
   } else if (ledOnTimeCommandTopic.equals(topic)) {
     captureCmd(g_onTimeCmdPayload, sizeof(g_onTimeCmdPayload), payload, len);
     g_onTimeCmdReceived = true;
+  } else if (batteryCalOffsetSetTopic.equals(topic)) {
+    captureCmd(g_battCalCmdPayload, sizeof(g_battCalCmdPayload), payload, len);
+    g_battCalCmdReceived = true;
   }
 }
 
@@ -458,6 +495,15 @@ void setup() {
     pressStartMs = bootMs > 0 ? bootMs : 1;
   }
 
+  // analogReadMilliVolts() uses the ESP32's factory ADC calibration (eFuse)
+  // for an accurate mV reading -- far more accurate than manually mapping
+  // raw analogRead() counts against an assumed 3.3V reference.
+  analogSetPinAttenuation((uint8_t)BATT_PIN, ADC_11db);
+  uint32_t rawMillivolts = analogReadMilliVolts(BATT_PIN);
+  float rawBattVoltage = (rawMillivolts / 1000.0f) * BATT_DIVIDER_RATIO;
+  float batteryVoltage = calibrateBatteryVoltage(rawBattVoltage) + settings.battVoltageOffsetV;
+  float batteryPercent = batteryPercentage(batteryVoltage);
+
   // Connect (one whole retry on a press wake -- a lost ring is worse than a
   // slightly slower failure on a heartbeat wake).
   bool connected = false;
@@ -479,12 +525,14 @@ void setup() {
       ringOk = publishWithAck(doorbellEventTopic, "{\"event_type\":\"press\"}", false);
     }
 
+    publishWithAck(deviceStatusTopic, "awake", true);
+
     if (!discoverySent) {
       sendDiscoveryConfig();
       discoverySent = true;
     }
 
-    int failedTopics = publishState(resetReasonStr);
+    int failedTopics = publishState(resetReasonStr, batteryVoltage, rawBattVoltage, batteryPercent);
     if (failedTopics == 0 && ringOk) {
       connectFailCount = 0; // every topic confirmed by the broker, counter clears
     } else {
@@ -532,6 +580,9 @@ void setup() {
     return;
   }
 
+  if (mqttClient.connected()) {
+    publishWithAck(deviceStatusTopic, "asleep", true);
+  }
   mqttClient.disconnect();
   delay(MQTT_DISCONNECT_DELAY_MS);
   WiFi.disconnect(true);
@@ -609,11 +660,12 @@ bool connectMQTT() {
 
       // Subscribe now: retained commands are delivered right away, and by
       // the time the publishes below finish they've been received.
-      g_otaCmdReceived = g_brightnessCmdReceived = g_colorCmdReceived = g_onTimeCmdReceived = false;
+      g_otaCmdReceived = g_brightnessCmdReceived = g_colorCmdReceived = g_onTimeCmdReceived = g_battCalCmdReceived = false;
       mqttClient.subscribe(ledBrightnessCommandTopic.c_str(), 1);
       mqttClient.subscribe(ledColorCommandTopic.c_str(), 1);
       mqttClient.subscribe(ledOnTimeCommandTopic.c_str(), 1);
       mqttClient.subscribe(otaCommandTopic.c_str(), 1);
+      mqttClient.subscribe(batteryCalOffsetSetTopic.c_str(), 1);
       return true;
     }
 
@@ -706,6 +758,57 @@ void sendDiscoveryConfig() {
   // don't count as a reset, see initUptime())
   sendSensorDiscovery(discoveryUptimeTopic, "Uptime", "uptime", uptimeTopic,
     "\"unit_of_measurement\":\"s\",\"device_class\":\"duration\",\"state_class\":\"measurement\",");
+  // Device Status -- "awake" while connected and doing something this wake,
+  // "asleep" the rest of the time (published right before the final MQTT
+  // disconnect). No expire_after: unlike the other diagnostics this is
+  // expected to sit unchanged ("asleep") for a whole heartbeat interval, so
+  // expiring it would just make it flap "unavailable" between wakes.
+  {
+    String payload = String("{")
+      + "\"name\":\"Device Status\","
+      + "\"unique_id\":\"" + settings.deviceId + "_device_status\","
+      + "\"state_topic\":\"" + deviceStatusTopic + "\","
+      + "\"icon\":\"mdi:sleep\","
+      + "\"entity_category\":\"diagnostic\","
+      + "\"availability_topic\":\"" + availabilityTopic + "\","
+      + deviceBlock() + "}";
+    publishWithAck(discoveryDeviceStatusTopic, payload, true);
+  }
+
+  sendSensorDiscovery(discoveryBatteryVoltageTopic, "Battery Voltage", "battery_voltage", batteryVoltageTopic,
+    "\"device_class\":\"voltage\",\"unit_of_measurement\":\"V\",\"state_class\":\"measurement\",");
+  sendSensorDiscovery(discoveryBatteryVRawTopic, "Battery Voltage (Raw)", "battery_voltage_raw", batteryVRawTopic,
+    "\"device_class\":\"voltage\",\"unit_of_measurement\":\"V\",\"state_class\":\"measurement\",");
+  sendSensorDiscovery(discoveryBatteryPercentTopic, "Battery", "battery_percent", batteryPercentTopic,
+    "\"device_class\":\"battery\",\"unit_of_measurement\":\"%\",\"state_class\":\"measurement\",");
+  // Battery Low: a real binary_sensor (not through sendSensorDiscovery(),
+  // which is for plain sensors), so it renders with HA's low-battery icon.
+  {
+    String payload = String("{")
+      + "\"name\":\"Battery Low\","
+      + "\"unique_id\":\"" + settings.deviceId + "_battery_low\","
+      + "\"state_topic\":\"" + batteryLowTopic + "\","
+      + "\"device_class\":\"battery\","
+      + "\"entity_category\":\"diagnostic\","
+      + "\"expire_after\":" + String(EXPIRE_AFTER_SEC) + ","
+      + "\"availability_topic\":\"" + availabilityTopic + "\","
+      + deviceBlock() + "}";
+    publishWithAck(discoveryBatteryLowTopic, payload, true);
+  }
+  // Battery Calibration Offset -- same mechanism as door_sensor/TH_2_v4: a
+  // plain volts-added correction on top of the compiled-in BATT_CAL curve.
+  {
+    String payload = String("{")
+      + "\"name\":\"Battery Calibration Offset\","
+      + "\"unique_id\":\"" + settings.deviceId + "_battery_cal_offset\","
+      + "\"state_topic\":\"" + batteryCalOffsetTopic + "\","
+      + "\"command_topic\":\"" + batteryCalOffsetSetTopic + "\","
+      + "\"min\":-1,\"max\":1,\"step\":0.01,\"unit_of_measurement\":\"V\","
+      + "\"mode\":\"box\",\"entity_category\":\"config\",\"retain\":true,"
+      + "\"availability_topic\":\"" + availabilityTopic + "\","
+      + deviceBlock() + "}";
+    publishWithAck(discoveryBatteryCalOffsetTopic, payload, true);
+  }
 
   // Controls: "retain":true makes HA publish commands retained, so a change
   // made while this device sleeps is still on the broker when it next wakes.
@@ -772,11 +875,16 @@ void sendDiscoveryConfig() {
 // ---------------------------------------------------------------------------
 // Per-wake state publish. Returns how many topics never got a PUBACK.
 // ---------------------------------------------------------------------------
-int publishState(const String& resetReasonStr) {
+int publishState(const String& resetReasonStr, float batteryVoltage, float rawVoltage, float batteryPercent) {
   int failed = 0;
   if (WiFi.status() == WL_CONNECTED) {
     if (!publishWithAck(wifiSignalTopic, String(WiFi.RSSI()), true)) failed++;
   }
+  if (!publishWithAck(batteryVoltageTopic, String(batteryVoltage, 2), true)) failed++;
+  if (!publishWithAck(batteryVRawTopic, String(rawVoltage, 3), true)) failed++;
+  if (!publishWithAck(batteryPercentTopic, String(batteryPercent, 0), true)) failed++;
+  bool batteryLow = batteryPercent < BATTERY_LOW_THRESHOLD_PCT;
+  if (!publishWithAck(batteryLowTopic, batteryLow ? "ON" : "OFF", true)) failed++;
   if (!publishWithAck(resetReasonTopic, resetReasonStr, true)) failed++;
   if (!publishWithAck(bootCountTopic, String((unsigned long)bootCount), true)) failed++;
   if (!publishWithAck(connectFailCountTopic, String((unsigned long)connectFailCount), true)) failed++;
@@ -810,6 +918,20 @@ void applyRemoteCommands() {
     if ((uint8_t)secs != ledOnSecs) setLedOnSecs((uint8_t)secs, true);
   }
   publishLedSettings();
+
+  // Battery calibration offset: applies starting next wake, not retroactively
+  // to the reading just published this cycle -- same pattern as door_sensor.
+  if (g_battCalCmdReceived) {
+    float requested = atof(g_battCalCmdPayload);
+    if (requested < -1.0f) requested = -1.0f;
+    if (requested > 1.0f) requested = 1.0f;
+    if (requested != settings.battVoltageOffsetV) {
+      settings.battVoltageOffsetV = requested;
+      saveSettings();
+      Serial.printf("Battery calibration offset set to %.3fV via HA.\n", settings.battVoltageOffsetV);
+    }
+  }
+  publishWithAck(batteryCalOffsetTopic, String(settings.battVoltageOffsetV, 3), true);
 }
 
 void publishLedSettings() {
@@ -932,6 +1054,58 @@ void setLedOnSecs(uint8_t secs, bool save) {
   ledOnSecs = secs;
   if (ledLit) ledLitUntilMs = ledLitStartMs + (unsigned long)ledOnSecs * 1000UL; // applies to the light-up in progress
   if (save) prefs.putUChar("led_secs", ledOnSecs);
+}
+
+// ---------------------------------------------------------------------------
+// Battery
+// ---------------------------------------------------------------------------
+float calibrateBatteryVoltage(float raw) {
+  if (raw <= BATT_CAL[0].raw) {
+    float slope = (BATT_CAL[1].actual - BATT_CAL[0].actual) / (BATT_CAL[1].raw - BATT_CAL[0].raw);
+    return BATT_CAL[0].actual + (raw - BATT_CAL[0].raw) * slope;
+  }
+  if (raw >= BATT_CAL[BATT_CAL_POINTS - 1].raw) {
+    float slope = (BATT_CAL[BATT_CAL_POINTS - 1].actual - BATT_CAL[BATT_CAL_POINTS - 2].actual)
+                 / (BATT_CAL[BATT_CAL_POINTS - 1].raw - BATT_CAL[BATT_CAL_POINTS - 2].raw);
+    return BATT_CAL[BATT_CAL_POINTS - 1].actual + (raw - BATT_CAL[BATT_CAL_POINTS - 1].raw) * slope;
+  }
+  for (int i = 0; i < BATT_CAL_POINTS - 1; i++) {
+    if (raw >= BATT_CAL[i].raw && raw <= BATT_CAL[i + 1].raw) {
+      float slope = (BATT_CAL[i + 1].actual - BATT_CAL[i].actual) / (BATT_CAL[i + 1].raw - BATT_CAL[i].raw);
+      return BATT_CAL[i].actual + (raw - BATT_CAL[i].raw) * slope;
+    }
+  }
+  return raw; // unreachable, keeps the compiler happy
+}
+
+// Piecewise-linear state-of-charge curve for a typical single-cell Li-ion,
+// same curve used across the other battery-powered sensors in this fleet so
+// readings are consistent device to device.
+float batteryPercentage(float v) {
+  float pct;
+  if (v >= 4.15)      pct = 100.0;
+  else if (v >= 4.10) pct = 95.0 + (v - 4.10) / 0.05 * 5.0;
+  else if (v >= 4.06) pct = 90.0 + (v - 4.06) / 0.04 * 5.0;
+  else if (v >= 4.01) pct = 85.0 + (v - 4.01) / 0.05 * 5.0;
+  else if (v >= 3.96) pct = 80.0 + (v - 3.96) / 0.05 * 5.0;
+  else if (v >= 3.91) pct = 75.0 + (v - 3.91) / 0.05 * 5.0;
+  else if (v >= 3.87) pct = 70.0 + (v - 3.87) / 0.04 * 5.0;
+  else if (v >= 3.80) pct = 65.0 + (v - 3.80) / 0.07 * 5.0;
+  else if (v >= 3.72) pct = 60.0 + (v - 3.72) / 0.08 * 5.0;
+  else if (v >= 3.68) pct = 55.0 + (v - 3.68) / 0.04 * 5.0;
+  else if (v >= 3.66) pct = 50.0 + (v - 3.66) / 0.02 * 5.0;
+  else if (v >= 3.62) pct = 45.0 + (v - 3.62) / 0.04 * 5.0;
+  else if (v >= 3.58) pct = 40.0 + (v - 3.58) / 0.04 * 5.0;
+  else if (v >= 3.54) pct = 35.0 + (v - 3.54) / 0.04 * 5.0;
+  else if (v >= 3.49) pct = 30.0 + (v - 3.49) / 0.05 * 5.0;
+  else if (v >= 3.44) pct = 25.0 + (v - 3.44) / 0.05 * 5.0;
+  else if (v >= 3.39) pct = 20.0 + (v - 3.39) / 0.05 * 5.0;
+  else if (v >= 3.34) pct = 15.0 + (v - 3.34) / 0.05 * 5.0;
+  else if (v >= 3.30) pct = 10.0 + (v - 3.30) / 0.04 * 5.0;
+  else if (v >= 3.25) pct =  5.0 + (v - 3.25) / 0.05 * 5.0;
+  else if (v >= 3.20) pct =  0.0 + (v - 3.20) / 0.05 * 5.0;
+  else                pct = 0.0;
+  return roundf(pct);
 }
 
 // ---------------------------------------------------------------------------

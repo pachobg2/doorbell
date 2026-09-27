@@ -61,3 +61,22 @@ static const uint32_t OTA_WINDOW_MS = 5UL * 60 * 1000UL; // how long to stay awa
 // longer deadline while an LED light-up, OTA window or setup portal
 // legitimately needs to stay awake (see the .ino).
 static const uint32_t AWAKE_WATCHDOG_TIMEOUT_MS = 90UL * 1000UL;
+
+// ------------------------------------------------------------------
+// Battery
+// ------------------------------------------------------------------
+// Divider ratio: two equal (220k/220k) resistors -> actual = reading * 2.0
+static const float BATT_DIVIDER_RATIO = 2.0f;
+
+// Piecewise-linear correction from raw divider-derived voltage to actual
+// voltage, for this specific board's ADC/divider error -- same mechanism as
+// door_sensor's BATT_CAL. Defaults to identity (no correction): measure this
+// board's own raw vs. actual voltage (multimeter on the battery, compare
+// against the raw value logged over serial) at a few points and replace
+// these before trusting precise battery %.
+struct CalPoint { float raw; float actual; };
+static const CalPoint BATT_CAL[] = {
+  {3.00f, 3.00f}, {4.20f, 4.20f},
+};
+static const int BATT_CAL_POINTS = sizeof(BATT_CAL) / sizeof(BATT_CAL[0]);
+static const float BATTERY_LOW_THRESHOLD_PCT = 15.0f;

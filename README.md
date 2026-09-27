@@ -33,8 +33,8 @@ ESP32-C3-Zero:
   after a press. Note the LED and the board's regulator draw a small
   quiescent current even when "off" — that, not the ESP32 in deep sleep,
   will likely dominate battery life.
-- No battery-voltage monitoring yet (no divider is wired on this board), so
-  there are no battery entities.
+- **GPIO1** — battery voltage divider, two equal 220kΩ resistors
+  (`BATT_DIVIDER_RATIO` 2.0), ADC-capable, same mechanism as `door_sensor`.
 
 ## Behavior
 
@@ -118,6 +118,12 @@ defaults to `doorbell_<chip-id>` if never configured).
 | Total fail count (lifetime) | `.../total_fail_count/state` | integer |
 | Firmware version | `.../firmware_version/state` | string |
 | Uptime (zeroes on reset/power loss, keeps counting through deep sleep) | `.../uptime/state` | seconds |
+| Device Status | `.../device_status/state` | `awake` / `asleep` |
+| Battery voltage (calibrated) | `.../battery_voltage/state` | volts |
+| Battery voltage (raw, pre-calibration) | `.../battery_voltage_raw/state` | volts |
+| Battery percent | `.../battery_percent/state` | % |
+| Battery low (< 15%) | `.../battery_low/state` | `ON` / `OFF` |
+| Battery calibration offset (HA number, retained cmd) | `.../battery_cal_offset/state`, `.../set` | volts, -1 to 1 (default 0) |
 
 The doorbell press is Home Assistant's MQTT **`event` entity**
 (`device_class: "doorbell"`, `homeassistant/event/<device_id>/doorbell/config`),
@@ -160,6 +166,23 @@ increments once per wake, not per power-up. Uptime uses the RTC counter, so
 it continues across deep-sleep wakes and zeroes on power-on, manual reset,
 brownout, watchdog, software restart, or a dead-and-replaced battery.
 
+**Device Status** is `awake` while the device is connected and doing
+something this wake, and `asleep` the rest of the time — published right
+before the final MQTT disconnect each cycle. Since the device is asleep the
+overwhelming majority of the time, expect to see `asleep` almost always; it's
+there to distinguish a currently-active cycle from the normal deep-sleep gap
+between wakes (which the shared `expire_after`/availability mechanism alone
+can't tell apart from a dead device).
+
+**Battery** voltage is read via the GPIO1 divider, corrected by the
+compiled-in `BATT_CAL` piecewise curve (identity by default — measure your
+own board's raw-vs-actual voltage and replace it) plus the runtime
+**Battery Calibration Offset**, then mapped to a percentage via the same
+Li-ion discharge curve used across the fleet's other battery projects.
+Battery Low trips under 15% (`BATTERY_LOW_THRESHOLD_PCT`). A calibration
+offset change applies starting the next wake, not retroactively to the
+reading just published.
+
 ## Config file
 
 `config.h` (gitignored) holds the OTA password, setup-portal AP
@@ -179,3 +202,4 @@ in NVS.
 | v1.0.1 | 2026-09-25 | Added an `Uptime` diagnostic sensor (seconds since boot, `device_class: duration`). Uses `esp_timer_get_time()` (64-bit) rather than `millis()`, so it zeroes on any reboot or power loss but never wraps back to zero on its own at ~49.7 days. |
 | v1.1.0 | 2026-09-25 | LED is now off when idle (previously solid green while WiFi was connected) and lights up on a doorbell press instead of a brief white flash. New HA `select` entity **LED Color** and **LED On Time** number (1-60 s, default 5), both NVS-persisted and applied immediately; light-up is non-blocking and a press while lit restarts the timer. |
 | v2.0.0 | 2026-09-25 | **Battery-powered, deep-sleep rewrite.** Sleeps until the doorbell switch is pressed (GPIO0 level wake) or a 12 h heartbeat fires; LED lights instantly on wake, the ring is published first, and the device stays awake while the LED is lit. Built on `door_sensor`'s deep-sleep machinery (RTC-kept counters, awake watchdog, blocking connect with PUBACK-confirmed publishes, one full connect retry on a press). Uptime now uses the RTC counter so it continues across deep sleep and zeroes only on a real reset/power loss; boot count is now wakes since power loss; discovery re-sent after any real reset. Control entities (LED brightness/color/on-time) are retained commands picked up on the next wake. New retained **OTA Update** switch replaces the always-on `ArduinoOTA` and the OTA Restart button (removed). Setup portal is unchanged (10 s hold; 5 s in-portal factory reset). Adds deep-sleep/MQTT timing constants to `config.h`. Breaking: needs an external ~10k pull-up on GPIO0; no battery monitoring yet. |
+| v2.1.0 | 2026-09-27 | Added battery monitoring via a 220k/220k divider on GPIO1 (voltage raw + calibrated, percent, low flag, HA-adjustable calibration offset — same mechanism as `door_sensor`), and a **Device Status** diagnostic sensor (`awake`/`asleep`) published right before the final MQTT disconnect each cycle. |
