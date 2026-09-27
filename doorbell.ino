@@ -558,6 +558,20 @@ void setup() {
     totalFailCount++;
   }
 
+  // Resync the button state against reality before watching for a hold.
+  // pressStartMs was seeded at boot from a press-wake, but the WiFi/MQTT
+  // connect + publish above can easily take several seconds -- if the
+  // button was already released during that time, buttonStable is still
+  // stuck at its stale wake-time LOW (nothing re-read the pin while we were
+  // busy connecting), so handleButton()'s hold check would otherwise see
+  // "held" for however long connecting took and could wrongly open the
+  // setup portal on an ordinary quick tap. Only a button that's *still*
+  // physically down right now keeps counting from when it was first
+  // pressed; one that's since been released has that dead time discarded.
+  bool stillPressed = (digitalRead(BUTTON_PIN) == LOW);
+  lastButtonReading = buttonStable = stillPressed ? LOW : HIGH;
+  if (!stillPressed) pressStartMs = 0;
+
   // Stay awake, still connected, while the LED is lit (a further press
   // during that window is reported live and restarts the timer) or the
   // button is still held (a hold this long opens the setup portal). A held
